@@ -34,7 +34,9 @@ class MainActivity : ComponentActivity() {
             TripMapTheme {
                 val vm: TripViewModel = viewModel()
                 var locationGranted by remember { mutableStateOf(hasLocationPermission()) }
+
                 val exportMessage by vm.exportMessage.collectAsState()
+                val viewNotice by vm.notice.collectAsState()
 
                 val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { permissions ->
                     locationGranted = permissions[Manifest.permission.ACCESS_FINE_LOCATION] == true || hasLocationPermission()
@@ -46,6 +48,11 @@ class MainActivity : ComponentActivity() {
                     val message = exportMessage ?: return@LaunchedEffect
                     Toast.makeText(this@MainActivity, message, Toast.LENGTH_LONG).show()
                     vm.clearExportMessage()
+                }
+                LaunchedEffect(viewNotice) {
+                    val message = viewNotice ?: return@LaunchedEffect
+                    Toast.makeText(this@MainActivity, message, Toast.LENGTH_LONG).show()
+                    vm.clearNotice()
                 }
 
                 var saveTripId by rememberSaveable { mutableStateOf(0L) }
@@ -62,6 +69,8 @@ class MainActivity : ComponentActivity() {
                 TripMapRoot(
                     viewModel = vm,
                     locationGranted = locationGranted,
+                    notice = viewNotice,
+                    onClearNotice = vm::clearNotice,
                     onSaveTripFile = { tripId, suggestedName -> saveTripId = tripId; saveLauncher.launch(suggestedName) },
                     onImportTripFile = { importMessage = null; importLauncher.launch(arrayOf("*/*")) },
                     importMessage = importMessage,
