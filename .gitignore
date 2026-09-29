@@ -1,0 +1,31 @@
+# Android / Gradle
+.gradle/
+build/
+*/build/
+.externalNativeBuild/
+.cxx/
+local.properties
+
+# Android Studio / IntelliJ
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# Signing / credentials
+*.jks
+*.keystore
+*.p12
+*.pfx
+keystore.properties
+google-services.json
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Generated / local files
+captures/
+.externalNativeBuild/
