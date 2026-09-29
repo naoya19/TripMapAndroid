@@ -3,14 +3,16 @@ package com.patipan.tripmap
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import android.net.Uri
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.google.android.gms.location.LocationServices
@@ -32,14 +34,23 @@ class MainActivity : ComponentActivity() {
             TripMapTheme {
                 val vm: TripViewModel = viewModel()
                 var locationGranted by remember { mutableStateOf(hasLocationPermission()) }
+                val exportMessage by vm.exportMessage.collectAsState()
+
                 val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { permissions ->
                     locationGranted = permissions[Manifest.permission.ACCESS_FINE_LOCATION] == true || hasLocationPermission()
                 }
                 LaunchedEffect(locationGranted) {
                     if (locationGranted) loadPreviewLocation()
                 }
-                var saveTripId by remember { mutableLongStateOf(0L) }
-                var importMessage by remember { mutableStateOf<String?>(null) }
+                LaunchedEffect(exportMessage) {
+                    val message = exportMessage ?: return@LaunchedEffect
+                    Toast.makeText(this@MainActivity, message, Toast.LENGTH_LONG).show()
+                    vm.clearExportMessage()
+                }
+
+                var saveTripId by rememberSaveable { mutableStateOf(0L) }
+                var importMessage by rememberSaveable { mutableStateOf<String?>(null) }
+
                 val saveLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/octet-stream")) { uri: Uri? ->
                     if (uri != null && saveTripId != 0L) vm.exportTrip(this@MainActivity, saveTripId, uri)
                 }
@@ -52,7 +63,7 @@ class MainActivity : ComponentActivity() {
                     viewModel = vm,
                     locationGranted = locationGranted,
                     onSaveTripFile = { tripId, suggestedName -> saveTripId = tripId; saveLauncher.launch(suggestedName) },
-                    onImportTripFile = { importMessage = null; importLauncher.launch(arrayOf("application/zip", "application/octet-stream", "*/*")) },
+                    onImportTripFile = { importMessage = null; importLauncher.launch(arrayOf("*/*")) },
                     importMessage = importMessage,
                     clearImportMessage = { importMessage = null },
                     requestPermissions = {

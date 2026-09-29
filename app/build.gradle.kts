@@ -11,10 +11,19 @@ val localProperties = Properties().apply {
     val file = rootProject.file("local.properties")
     if (file.exists()) file.inputStream().use(::load)
 }
-val mapsApiKey = localProperties.getProperty("MAPS_API_KEY")?.trim().orEmpty()
-if (mapsApiKey.isBlank() || mapsApiKey.contains("YOUR_GOOGLE_MAPS_API_KEY")) {
-    throw GradleException(
-        "ไม่พบ MAPS_API_KEY: เพิ่ม MAPS_API_KEY=คีย์ของคุณ ในไฟล์ local.properties แล้ว Sync ใหม่"
+
+val mapsApiKey = localProperties.getProperty("MAPS_API_KEY")?.trim()
+    ?.takeIf { it.isNotBlank() && !it.contains("YOUR_GOOGLE_MAPS_API_KEY") }
+    ?: "DUMMY_KEY_BUILD_WITHOUT_MAPS"
+
+if (mapsApiKey.startsWith("DUMMY_KEY")) {
+    logger.warn(
+        """
+        ⚠️ ไม่พบ MAPS_API_KEY ใน local.properties — แผนที่จะแสดงเป็นพื้นสีเทา
+        วิธีตั้งค่า: สร้างไฟล์ local.properties ที่รากโปรเจกต์ แล้วใส่
+            MAPS_API_KEY=คีย์ของคุณ
+        (ดูตัวอย่างได้ใน local.properties.example) แล้วกด Sync ใหม่
+        """.trimIndent()
     )
 }
 
@@ -26,8 +35,8 @@ android {
         applicationId = "com.patipan.tripmap"
         minSdk = 26
         targetSdk = 35
-        versionCode = 6
-        versionName = "0.6.0"
+        versionCode = 14
+        versionName = "1.4.0"
         manifestPlaceholders["MAPS_API_KEY"] = mapsApiKey
     }
 
