@@ -126,7 +126,6 @@ private fun TripScreen(
     LaunchedEffect(state.isTracking) {
         while (state.isTracking) { now = System.currentTimeMillis(); delay(1_000) }
     }
-    // เตือนจาก ViewModel (เช่น ช่วงทับซ้อน) แล้วล้างทิ้ง
     LaunchedEffect(notice) {
         if (notice != null) onClearNotice()
     }
@@ -573,11 +572,9 @@ private fun JunctionEditDialog(
                     }
                 }
                 Text("ประเภท", style = MaterialTheme.typography.labelMedium)
-                Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
-                    Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                        JunctionType.entries.forEach { t ->
-                            FilterChip(type == t, { type = t }, label = { Text(t.label(), style = MaterialTheme.typography.labelSmall) })
-                        }
+                Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                    JunctionType.entries.forEach { t ->
+                        FilterChip(type == t, { type = t }, label = { Text(t.label(), style = MaterialTheme.typography.labelSmall) })
                     }
                 }
                 if (type == JunctionType.THREE_WAY || type == JunctionType.T) {
@@ -595,7 +592,7 @@ private fun JunctionEditDialog(
                     Column(Modifier.weight(1f)) {
                         Text("วัดค่าถนนเฉพาะจุดนี้", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
                         Text(
-                            if (override) "ใช้ค่าที่กรอกเอง" else "ใช้ค่าจากช่วงถนน: ${eff.summary()}",
+                            if (override) "ใช้ค่าที่กรอกเอง" else "ใช้ค่าจา่านช่วงถนน: ${eff.summary()}",
                             style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline
                         )
                     }
@@ -884,11 +881,14 @@ private fun RealtimeMap(
         if (layerState.showChainage) chainageMarkers(points, interval, config, selectedKm) else emptyList()
     }
     val segmentLines = remember(points, roadSegments, layerState.showSegments) {
-        if (!layerState.showSegments) emptyList()
-        else roadSegments.mapNotNull { seg ->
-            sliceByChainage(points, seg.startChainageMeters.toDouble(), seg.endChainageMeters.toDouble())
-                .let { decimatePoints(it).map { p -> LatLng(p.latitude, p.longitude) } }
-                .takeIf { it.size > 1 }?.let { seg to it }
+        if (!layerState.showSegments) return@remember emptyList()
+        roadSegments.mapNotNull { seg ->
+            val lo = seg.startChainageMeters.toDouble()
+            val hi = seg.endChainageMeters.toDouble()
+            val slice = sliceByChainage(points, lo, hi)
+            if (slice.size < 2) return@mapNotNull null
+            val coords = decimatePoints(slice).map { p -> LatLng(p.latitude, p.longitude) }
+            seg to coords
         }
     }
 
@@ -1059,13 +1059,15 @@ private fun junctionLabel(junction: JunctionPoint): String {
     return "${junction.type.label()} ($sideLabel)"
 }
 
+/** ✅ แก้จุดที่ 4 — ส่งช่วงถนนไปกับรายงาน */
 private fun shareCurrent(context: Context, state: TrackingState, format: ReportFormat) {
     val start = state.startedAt ?: System.currentTimeMillis()
     TripReportExporter.share(context, TripReport(
         start, System.currentTimeMillis() - start,
         state.chainageMeters, state.traveledDistanceMeters, state.points,
         startChainage = state.startChainage,
-        junctions = state.junctions
+        junctions = state.junctions,
+        roadSegments = state.roadSegments
     ), format)
 }
 
@@ -1375,7 +1377,9 @@ private fun HistoryDetailScreen(
 
     if (renameOpen) RenameTripDialog(trip, { renameOpen = false }) { onRename(trip.id, it); renameOpen = false }
     if (deleteOpen) DeleteTripDialog(trip, { deleteOpen = false }) { onDelete(trip.id); deleteOpen = false }
-    if (exportOpen) ExportDialog(trip, points, tripConfig, junctions, onDismiss = { exportOpen = false })
+
+    // ✅ แก้จุดที่ 1 — ส่ง segments เข้า ExportDialog
+    if (exportOpen) ExportDialog(trip, points, tripConfig, junctions, segments, onDismiss = { exportOpen = false })
 
     editJunction?.let { j ->
         JunctionEditDialog(
@@ -1395,12 +1399,14 @@ private fun HistoryDetailScreen(
     }
 }
 
+/** ✅ แก้จุดที่ 2 + 3 — รับ segments และส่งต่อไปยัง TripReport */
 @Composable
 private fun ExportDialog(
     trip: TripEntity,
     points: List<TrackPoint>,
     config: StartChainageConfig,
     junctions: List<JunctionPoint>,
+    segments: List<RoadSegment>,
     onDismiss: () -> Unit
 ) {
     val context = LocalContext.current
@@ -1426,6 +1432,9 @@ private fun ExportDialog(
                     OutlinedTextField(endText, { endText = it.filter { c -> c.isDigit() || c == '+' }.take(12) }, Modifier.weight(1f), label = { Text("ถึง เช่น 12+000") }, singleLine = true)
                 }
                 Text("ช่วงที่จะ Export: ${chainageLabel(config.displayMeters(routeStart.toDouble()), config.direction)} – ${chainageLabel(config.displayMeters(routeEnd.toDouble()), config.direction)}", style = MaterialTheme.typography.labelMedium)
+                if (segments.isNotEmpty()) {
+                    Text("รวมช่วงถนน ${segments.size} ช่วงในไฟล์ DXF/KMZ", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
+                }
                 Text("ระยะป้าย/รายละเอียด", fontWeight = FontWeight.SemiBold)
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     FilterChip(interval == 1_000, { interval = 1_000 }, label = { Text("ภาพรวม · ทุก 1 กม.") })
@@ -1439,7 +1448,12 @@ private fun ExportDialog(
         },
         confirmButton = {
             TextButton(onClick = {
-                TripReportExporter.share(context, TripReport(trip.startedAt, trip.durationMillis, trip.netDistanceMeters, trip.traveledDistanceMeters, points, tripDisplayName(trip), config, junctions, ExportSelection(routeStart, routeEnd, interval)), format)
+                TripReportExporter.share(context, TripReport(
+                    trip.startedAt, trip.durationMillis, trip.netDistanceMeters, trip.traveledDistanceMeters,
+                    points, tripDisplayName(trip), config, junctions,
+                    roadSegments = segments,
+                    selection = ExportSelection(routeStart, routeEnd, interval)
+                ), format)
                 onDismiss()
             }, enabled = points.size > 1) { Text("Export") }
         },
@@ -1508,11 +1522,14 @@ private fun HistoryMap(
     val selectedKm = if (detailMode) previewMeters.toInt() / 1_000 else null
     val markers = remember(points, interval, config, selectedKm) { chainageMarkers(points, interval, config, selectedKm) }
     val segmentLines = remember(points, roadSegments, showSegments) {
-        if (!showSegments) emptyList()
-        else roadSegments.mapNotNull { seg ->
-            sliceByChainage(points, seg.startChainageMeters.toDouble(), seg.endChainageMeters.toDouble())
-                .let { decimatePoints(it).map { p -> LatLng(p.latitude, p.longitude) } }
-                .takeIf { it.size > 1 }?.let { seg to it }
+        if (!showSegments) return@remember emptyList()
+        roadSegments.mapNotNull { seg ->
+            val lo = seg.startChainageMeters.toDouble()
+            val hi = seg.endChainageMeters.toDouble()
+            val slice = sliceByChainage(points, lo, hi)
+            if (slice.size < 2) return@mapNotNull null
+            val coords = decimatePoints(slice).map { p -> LatLng(p.latitude, p.longitude) }
+            seg to coords
         }
     }
 

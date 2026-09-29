@@ -1,27 +1,47 @@
 package com.patipan.tripmap.dxf
 
 import android.content.Context
-import com.patipan.tripmap.tracking.ChainageDirection
-import com.patipan.tripmap.tracking.JunctionPoint
-import com.patipan.tripmap.tracking.JunctionSide
-import com.patipan.tripmap.tracking.JunctionType
-import com.patipan.tripmap.tracking.StartChainageConfig
-import com.patipan.tripmap.tracking.TrackPoint
+import com.patipan.tripmap.data.SurfaceKind
+import com.patipan.tripmap.tracking.*
 import java.io.File
 import kotlin.math.abs
 import kotlin.math.max
 
-/** แปลงเส้นทาง+จุดทางแยกที่บันทึกไว้ ให้เป็นไฟล์ DXF พร้อมเปิดใน AutoCAD โดยตรงบนมือถือ */
+/** แปลงเส้นทาง+จุดทางแยก+ช่วงถนน ให้เป็นไฟล์ DXF พร้อมเปิดใน AutoCAD โดยตรง
+ *
+ *  เขียนเป็น ASCII รูปแบบ R12 (AC1009) ซึ่งเปิดได้ทุกเวอร์ชันตั้งแต่ AutoCAD 2000 ถึงปัจจุบัน
+ *  พิกัดเป็นระบบ UTM เมตร 2 มิติ (ไม่มี Z ตามที่ตกลงกัน)
+ */
 object DxfExporter {
     data class Options(
         val roadWidthMeters: Double = 7.0,
         val lanes: Int = 2,
         val branchWidthMeters: Double = 6.0,
         val branchLengthMeters: Double = 40.0,
-        val cornerSmoothingMeters: Double = 1.2
+        val cornerSmoothingMeters: Double = 1.2,
+        /** ชั้นที่ผู้ใช้เปิดไว้ในแผงชั้นข้อมูล — ปิด = ไม่เขียนลง DXF */
+        val includeCenterline: Boolean = true,
+        val includeRoadEdge: Boolean = true,
+        val includeLaneDivider: Boolean = true,
+        val includeChainage: Boolean = true,
+        val includeJunctions: Boolean = true,
+        val includeNotes: Boolean = false
     )
 
     data class Result(val file: File, val utmZoneLabel: String)
+
+    /** ช่วงของเส้นทางหนึ่งช่วง พร้อมช่วงถนนที่ครอบคลุม (null = ไม่ได้บันทึกค่าถนน) */
+    private data class Span(
+        val segment: RoadSegment?,
+        val fromMeters: Double,
+        val toMeters: Double,
+        val points: List<TrackPoint>
+    )
+
+    /** ชื่อ layer ของช่วงถนน: ROAD_SEG_01, ROAD_SEG_02, …
+     *  ชื่อช่วงจริงจะไปอยู่ใน TEXT แทน เพราะชื่อ layer ของ DXF จำกัด 31 ตัวอักษรและห้ามมีอักษรพิเศษ
+     */
+    fun segmentLayerName(index: Int) = "ROAD_SEG_%02d".format(index + 1)
 
     fun export(
         context: Context,
@@ -29,10 +49,16 @@ object DxfExporter {
         junctions: List<JunctionPoint>,
         startChainage: StartChainageConfig,
         fileName: String,
+        roadSegments: List<RoadSegment> = emptyList(),
         options: Options = Options(),
         intervalMeters: Int = 100
     ): Result {
         require(points.size >= 2) { "ต้องมีอย่างน้อย 2 จุดในเส้นทางถึงจะสร้าง DXF ได้" }
+
+        val maxChain = points.maxOf { it.chainageMeters }
+        val segments = roadSegments
+            .sortedBy { it.startChainageMeters }
+            .filter { it.startChainageMeters < maxChain }
 
         val centroidLat = points.sumOf { it.latitude } / points.size
         val centroidLon = points.sumOf { it.longitude } / points.size
@@ -43,78 +69,170 @@ object DxfExporter {
         }
 
         val routeXy = points.map { project(it.latitude, it.longitude) }
-        val halfWidth = options.roadWidthMeters / 2
+        val baseHalfWidth = options.roadWidthMeters / 2
 
-        val branchCenterlines = mutableListOf<List<RoadGeometry.Pt>>()
-        val junctionLabels = mutableListOf<Pair<RoadGeometry.Pt, String>>()
-        for (j in junctions) {
+        val spans = buildSpans(points, segments, maxChain)
+
+        // ── แขนแยก: จัดเข้าช่วงตามระยะของจุดทางแยก ──
+        data class Branch(val centerline: List<RoadGeometry.Pt>, val chainage: Double)
+        val branches = junctions.mapNotNull { j ->
             val jXy = project(j.latitude, j.longitude)
             val (basePt, tangent) = RoadGeometry.nearestPointAndTangent(routeXy, jXy)
             val normal = RoadGeometry.Pt(-tangent.y, tangent.x)
+            val attrs = j.effective(segments)
+            val branchWidth = (attrs.totalWidthMeters ?: options.branchWidthMeters).coerceIn(2.0, 30.0)
             val sides = when (j.side) {
-                // normal = (-tangent.y, tangent.x) ชี้ไปทางซ้ายของทิศทางเดินทาง (rotate ทวนเข็ม 90°)
-                // ดังนั้น RIGHT ต้องใช้ด้านตรงข้าม normal (-1) ส่วน LEFT ใช้ทิศเดียวกับ normal (+1)
                 JunctionSide.RIGHT -> listOf(-1.0)
                 JunctionSide.LEFT -> listOf(1.0)
                 JunctionSide.BOTH -> listOf(1.0, -1.0)
             }
-            sides.forEach { s ->
-                val end = RoadGeometry.Pt(basePt.x + normal.x * s * options.branchLengthMeters, basePt.y + normal.y * s * options.branchLengthMeters)
-                branchCenterlines += listOf(basePt, end)
+            sides.map { s ->
+                Branch(
+                    centerline = listOf(
+                        basePt,
+                        RoadGeometry.Pt(
+                            basePt.x + normal.x * s * options.branchLengthMeters,
+                            basePt.y + normal.y * s * options.branchLengthMeters
+                        )
+                    ),
+                    chainage = j.nearestChainageMeters
+                )
             }
-            junctionLabels += basePt to if (j.type == JunctionType.THREE_WAY) "3-way" else "4-way"
+        }.flatten()
+
+        val junctionLabels = mutableListOf<Pair<RoadGeometry.Pt, String>>()
+        val junctionNotes = mutableListOf<Pair<RoadGeometry.Pt, String>>()
+        for (j in junctions) {
+            val jXy = project(j.latitude, j.longitude)
+            val (basePt, _) = RoadGeometry.nearestPointAndTangent(routeXy, jXy)
+            junctionLabels += basePt to "${j.type.label()} (${sideLabel(j.side)})"
+            val summary = j.effective(segments).summary()
+            if (summary.isNotBlank()) junctionNotes += RoadGeometry.Pt(basePt.x + 3, basePt.y - 1.2) to summary
         }
 
-        val mainPoly = RoadGeometry.roadPolygon(routeXy, halfWidth)
-        val branchPolys = branchCenterlines.map { RoadGeometry.roadPolygon(it, options.branchWidthMeters / 2) }
-        val merged = RoadGeometry.unionAll(listOf(mainPoly) + branchPolys)
-        val smoothed = RoadGeometry.smooth(merged, options.cornerSmoothingMeters)
-        val surfacePolys = RoadGeometry.surfacePolygons(smoothed)
-
-        val freeEnds = listOf(routeXy.first(), routeXy.last()) + branchCenterlines.map { it.last() }
-        val capRadius = max(halfWidth, options.branchWidthMeters / 2) + options.cornerSmoothingMeters + 3.0
-        val edgeChains = RoadGeometry.trimCaps(surfacePolys, freeEnds, capRadius)
-
+        // ── เตรียมชั้น ──
         val writer = DxfWriter()
-        writer.defineLayer("ROUTE_CENTERLINE", 8)
+        writer.defineLayer("ROUTE_CENTERLINE", 5)
         writer.defineLayer("ROAD_EDGE", 7)
         writer.defineLayer("LANE_DIVIDER", 2, "DASHED")
         writer.defineLayer("CHAINAGE_LEADER", 1)
         writer.defineLayer("CHAINAGE_TEXT", 1)
         writer.defineLayer("JUNCTION", 4)
-        val allX = routeXy.map { it.x } + branchCenterlines.flatten().map { it.x }
-        val allY = routeXy.map { it.y } + branchCenterlines.flatten().map { it.y }
+        writer.defineLayer("SURVEY_NOTE", 6)
+        segments.forEachIndexed { index, seg -> writer.defineLayer(segmentLayerName(index), seg.colorIndex) }
+
+        val allX = routeXy.map { it.x } + branches.map { it.centerline[1].x }
+        val allY = routeXy.map { it.y } + branches.map { it.centerline[1].y }
         writer.writeHeader(allX.min(), allY.min(), allX.max(), allY.max())
         writer.writeTables()
         writer.writeEmptyBlocks()
         writer.beginEntities()
 
-        edgeChains.forEach { chain -> writer.writePolyline("ROAD_EDGE", chain.map { doubleArrayOf(it.x, it.y) }) }
-        writer.writePolyline("ROUTE_CENTERLINE", routeXy.map { doubleArrayOf(it.x, it.y) })
-        if (options.lanes >= 2) writer.writePolyline("LANE_DIVIDER", routeXy.map { doubleArrayOf(it.x, it.y) }, linetype = "DASHED")
-        branchCenterlines.forEach { bc -> writer.writePolyline("ROUTE_CENTERLINE", bc.map { doubleArrayOf(it.x, it.y) }) }
-
-        val maxChain = points.maxOf { it.chainageMeters }
-        var d = points.minOf { it.chainageMeters }
-        var labelIndex = 0
-        val labelStep = intervalMeters.coerceIn(100, 1_000)
-        while (d <= maxChain) {
-            val nearest = points.minByOrNull { abs(it.chainageMeters - d) }
-            if (nearest != null) {
-                val p = project(nearest.latitude, nearest.longitude)
-                val (_, tangent) = RoadGeometry.nearestPointAndTangent(routeXy, p)
-                val normal = RoadGeometry.Pt(-tangent.y, tangent.x)
-                val side = if (labelIndex % 2 == 0) 1.0 else -1.0
-                val anchor = RoadGeometry.Pt(p.x + normal.x * (halfWidth + 1.0) * side, p.y + normal.y * (halfWidth + 1.0) * side)
-                val textPos = RoadGeometry.Pt(p.x + normal.x * (halfWidth + 6.0) * side, p.y + normal.y * (halfWidth + 6.0) * side)
-                writer.writeLine("CHAINAGE_LEADER", anchor.x, anchor.y, textPos.x, textPos.y)
-                writer.writeText("CHAINAGE_TEXT", chainageLabel(startChainage.displayMeters(d)), textPos.x, textPos.y)
-                labelIndex++
+        // ── เส้นกึ่งกลาง (ทั้งเส้นหลักและแขนแยก) ──
+        if (options.includeCenterline) {
+            writer.writePolyline("ROUTE_CENTERLINE", routeXy.map { doubleArrayOf(it.x, it.y) })
+            branches.forEach { b ->
+                writer.writePolyline("ROUTE_CENTERLINE", b.centerline.map { doubleArrayOf(it.x, it.y) })
             }
-            d += labelStep
         }
 
-        junctionLabels.forEach { (pt, label) -> writer.writeText("JUNCTION", label, pt.x + 3, pt.y + 3, height = 3.0) }
+        // ── ช่วงถนน: แต่ละช่วงได้ความกว้างของตัวเอง ──
+        spans.forEach { span ->
+            val seg = span.segment
+            val layer = seg?.let { segmentLayerName(segments.indexOf(it)) } ?: "ROAD_EDGE"
+            val attrs = seg?.attributes()
+                ?: RoadAttributes(options.lanes, options.roadWidthMeters, null, SurfaceKind.UNKNOWN, null)
+            val halfWidth = ((attrs.totalWidthMeters ?: options.roadWidthMeters) / 2).coerceIn(1.0, 30.0)
+            val centerLine = span.points.map { project(it.latitude, it.longitude) }
+            if (centerLine.size < 2) return@forEach
+
+            val spanBranches = branches.filter {
+                it.chainage >= span.fromMeters && it.chainage <= span.toMeters
+            }
+
+            if (options.includeRoadEdge) {
+                val polygons = buildList {
+                    add(RoadGeometry.roadPolygon(centerLine, halfWidth))
+                    spanBranches.forEach {
+                        add(RoadGeometry.roadPolygon(it.centerline, halfWidth))
+                    }
+                }
+                val merged = RoadGeometry.unionAll(polygons)
+                val smoothed = RoadGeometry.smooth(merged, options.cornerSmoothingMeters)
+                val surfacePolys = RoadGeometry.surfacePolygons(smoothed)
+
+                // ตัดปลายเฉพาะที่เป็นอิสระจริง ๆ: ต้นทาง/ปลายทางของเส้นทาง + ปลายแขนแยก
+                // ขอบเขตระหว่างช่วง (ที่ความกว้างเปลี่ยน) ต้องคงไว้ เพราะเป็นรอยต่อจริงของงานสำรวจ
+                val freeEnds = buildList {
+                    if (span.fromMeters <= 0.0) add(centerLine.first())
+                    if (span.toMeters >= maxChain) add(centerLine.last())
+                    spanBranches.forEach { add(it.centerline.last()) }
+                }
+                val capRadius = halfWidth + options.cornerSmoothingMeters + 3.0
+                RoadGeometry.trimCaps(surfacePolys, freeEnds, capRadius).forEach { chain ->
+                    writer.writePolyline(layer, chain.map { doubleArrayOf(it.x, it.y) })
+                }
+            }
+
+            if (options.includeLaneDivider && (attrs.lanes ?: 0) >= 2) {
+                writer.writePolyline(layer, centerLine.map { doubleArrayOf(it.x, it.y) }, linetype = "DASHED")
+            }
+
+            if (seg != null && options.includeNotes) {
+                val mid = pointAtChainage(span.points, (span.fromMeters + span.toMeters) / 2.0)
+                val midXy = mid?.let { project(it.latitude, it.longitude) }
+                if (midXy != null) {
+                    seg.dxfLines(startChainage).forEachIndexed { i, line ->
+                        writer.writeText("SURVEY_NOTE", line, midXy.x + 4, midXy.y + 4 - i * 1.8, height = 1.8)
+                    }
+                }
+            }
+        }
+
+        // ── ป้ายระยะ กม. ──
+        if (options.includeChainage) {
+            val minChain = points.minOf { it.chainageMeters }
+            val labelStep = intervalMeters.coerceIn(100, 1_000)
+            var d = minChain
+            var labelIndex = 0
+            while (d <= maxChain) {
+                val nearest = points.minByOrNull { abs(it.chainageMeters - d) }
+                if (nearest != null) {
+                    val p = project(nearest.latitude, nearest.longitude)
+                    val (_, tangent) = RoadGeometry.nearestPointAndTangent(routeXy, p)
+                    val normal = RoadGeometry.Pt(-tangent.y, tangent.x)
+                    val side = if (labelIndex % 2 == 0) 1.0 else -1.0
+                    val anchor = RoadGeometry.Pt(
+                        p.x + normal.x * (baseHalfWidth + 1.0) * side,
+                        p.y + normal.y * (baseHalfWidth + 1.0) * side
+                    )
+                    val textPos = RoadGeometry.Pt(
+                        p.x + normal.x * (baseHalfWidth + 6.0) * side,
+                        p.y + normal.y * (baseHalfWidth + 6.0) * side
+                    )
+                    writer.writeLine("CHAINAGE_LEADER", anchor.x, anchor.y, textPos.x, textPos.y)
+                    writer.writeText(
+                        "CHAINAGE_TEXT",
+                        chainageLabel(startChainage.displayMeters(d)),
+                        textPos.x, textPos.y
+                    )
+                    labelIndex++
+                }
+                d += labelStep
+            }
+        }
+
+        // ── จุดทางแยก ──
+        if (options.includeJunctions) {
+            junctionLabels.forEach { (pt, label) ->
+                writer.writeText("JUNCTION", label, pt.x + 3, pt.y + 3, height = 3.0)
+            }
+            if (options.includeNotes) {
+                junctionNotes.forEach { (pt, text) ->
+                    writer.writeText("SURVEY_NOTE", text, pt.x + 3, pt.y, height = 1.6)
+                }
+            }
+        }
 
         writer.endEntities()
         writer.writeEof()
@@ -123,6 +241,43 @@ object DxfExporter {
         val outFile = File(outDir, fileName)
         writer.save(outFile)
         return Result(outFile, zone.label)
+    }
+
+    /** แบ่งเส้นทางเป็นช่วงตามที่ผู้ใช้บันทึกไว้ — ช่วงก่อนแรกและหลังสุดที่ไม่มีข้อมูลถือว่าไม่มีช่วง */
+    private fun buildSpans(
+        points: List<TrackPoint>,
+        segments: List<RoadSegment>,
+        maxChain: Double
+    ): List<Span> {
+        if (segments.isEmpty()) {
+            return listOf(Span(null, points.first().chainageMeters, maxChain, points))
+        }
+        val spans = mutableListOf<Span>()
+        var from = 0.0
+        segments.forEach { seg ->
+            val segStart = seg.startChainageMeters.toDouble().coerceIn(0.0, maxChain)
+            if (segStart > from) {
+                val lead = sliceByChainage(points, from, segStart)
+                if (lead.size >= 2) spans += Span(null, from, segStart, lead)
+            }
+            val to = seg.endChainageMeters.toDouble().coerceAtMost(maxChain)
+            if (to > segStart) {
+                val slice = sliceByChainage(points, segStart, to)
+                if (slice.size >= 2) spans += Span(seg, segStart, to, slice)
+            }
+            from = max(from, to)
+        }
+        if (from < maxChain) {
+            val tail = points.filter { it.chainageMeters > from }
+            if (tail.size >= 2) spans += Span(null, from, maxChain, tail)
+        }
+        return spans
+    }
+
+    private fun sideLabel(side: JunctionSide) = when (side) {
+        JunctionSide.LEFT -> "ซ้าย"
+        JunctionSide.RIGHT -> "ขวา"
+        JunctionSide.BOTH -> "ทั้งสองด้าน"
     }
 
     private fun chainageLabel(meters: Int): String {

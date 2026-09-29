@@ -1,16 +1,14 @@
 package com.patipan.tripmap.share
 
-import android.content.ContentResolver
 import android.content.Context
 import android.net.Uri
+import com.patipan.tripmap.TripMapApplication
 import com.patipan.tripmap.data.JunctionEntity
+import com.patipan.tripmap.data.RoadSegmentEntity
 import com.patipan.tripmap.data.TrackPointEntity
 import com.patipan.tripmap.data.TripEntity
-import com.patipan.tripmap.tracking.JunctionPoint
-import com.patipan.tripmap.tracking.TrackPoint
-import com.patipan.tripmap.tracking.StartChainageConfig
-import java.io.BufferedReader
-import java.io.InputStreamReader
+import com.patipan.tripmap.tracking.*
+import java.io.ByteArrayOutputStream
 import java.io.OutputStreamWriter
 import java.nio.charset.StandardCharsets
 import java.util.Properties
@@ -22,13 +20,21 @@ import java.util.zip.ZipOutputStream
 data class ImportedTrip(
     val trip: TripEntity,
     val points: List<TrackPoint>,
-    val junctions: List<JunctionPoint>
+    val junctions: List<JunctionPoint>,
+    val roadSegments: List<RoadSegment> = emptyList()
 )
 
 object TripArchive {
     private const val VERSION = "1"
 
-    fun write(context: Context, uri: Uri, trip: TripEntity, points: List<TrackPoint>, junctions: List<JunctionPoint>) {
+    fun write(
+        context: Context,
+        uri: Uri,
+        trip: TripEntity,
+        points: List<TrackPoint>,
+        junctions: List<JunctionPoint>,
+        roadSegments: List<RoadSegment> = emptyList()
+    ) {
         context.contentResolver.openOutputStream(uri)?.use { out ->
             ZipOutputStream(out).use { zip ->
                 val meta = Properties().apply {
@@ -44,7 +50,7 @@ object TripArchive {
                     setProperty("chainageDirection", trip.chainageDirection)
                 }
                 zip.putNextEntry(ZipEntry("trip.properties"))
-                val metaBytes = java.io.ByteArrayOutputStream().also { baos ->
+                val metaBytes = ByteArrayOutputStream().also { baos ->
                     OutputStreamWriter(baos, StandardCharsets.UTF_8).use { meta.store(it, "Trip Map portable trip") }
                 }.toByteArray()
                 zip.write(metaBytes)
@@ -59,9 +65,26 @@ object TripArchive {
                 zip.closeEntry()
 
                 zip.putNextEntry(ZipEntry("junctions.csv"))
-                zip.write("id,latitude,longitude,type,side,source,nearestChainageMeters,timestamp\n".toByteArray(StandardCharsets.UTF_8))
+                zip.write("id,latitude,longitude,type,side,source,nearestChainageMeters,timestamp,note,lanes,widthMeters,shoulderMeters,surface,photoRef\n".toByteArray(StandardCharsets.UTF_8))
                 junctions.forEach { j ->
-                    val line = listOf(j.id, j.latitude, j.longitude, j.type.name, j.side.name, j.source.name, j.nearestChainageMeters, j.timestamp).joinToString(",") + "\n"
+                    val line = listOf(
+                        j.id, j.latitude, j.longitude, j.type.name, j.side.name, j.source.name,
+                        j.nearestChainageMeters, j.timestamp,
+                        csvText(j.note), j.lanes ?: "", j.widthMeters ?: "", j.shoulderMeters ?: "",
+                        j.surface, csvText(j.photoRef ?: "")
+                    ).joinToString(",") + "\n"
+                    zip.write(line.toByteArray(StandardCharsets.UTF_8))
+                }
+                zip.closeEntry()
+
+                zip.putNextEntry(ZipEntry("road_segments.csv"))
+                zip.write("name,startChainageMeters,endChainageMeters,lanes,widthMeters,shoulderMeters,surface,note,colorIndex\n".toByteArray(StandardCharsets.UTF_8))
+                roadSegments.forEach { s ->
+                    val line = listOf(
+                        csvText(s.name), s.startChainageMeters, s.endChainageMeters, s.lanes,
+                        s.widthMeters ?: "", s.shoulderMeters ?: "", s.surface,
+                        csvText(s.note), s.colorIndex
+                    ).joinToString(",") + "\n"
                     zip.write(line.toByteArray(StandardCharsets.UTF_8))
                 }
                 zip.closeEntry()
@@ -73,11 +96,13 @@ object TripArchive {
         var meta: Properties? = null
         val points = mutableListOf<TrackPoint>()
         val junctions = mutableListOf<JunctionPoint>()
+        val segments = mutableListOf<RoadSegment>()
+
         context.contentResolver.openInputStream(uri)?.use { input ->
             ZipInputStream(input).use { zip ->
                 while (true) {
                     val entry = zip.nextEntry ?: break
-                    val bytes = java.io.ByteArrayOutputStream().also { baos ->
+                    val bytes = ByteArrayOutputStream().also { baos ->
                         val buffer = ByteArray(8192)
                         while (true) {
                             val n = zip.read(buffer)
@@ -87,18 +112,42 @@ object TripArchive {
                     }.toByteArray()
                     val text = String(bytes, StandardCharsets.UTF_8)
                     when (entry.name) {
-                        "trip.properties" -> Properties().also { it.load(java.io.StringReader(text)); meta = it }
+                        "trip.properties" -> Properties().also { it.load(text.reader()); meta = it }
                         "points.csv" -> text.lineSequence().drop(1).forEach { line ->
                             val v = line.split(',')
-                            if (v.size >= 6) points += TrackPoint(v[1].toDouble(), v[2].toDouble(), v[3].toFloat(), v[4].toLong(), v[5].toDouble())
+                            if (v.size >= 6) points += TrackPoint(
+                                v[1].toDouble(), v[2].toDouble(), v[3].toFloat(), v[4].toLong(), v[5].toDouble()
+                            )
                         }
                         "junctions.csv" -> text.lineSequence().drop(1).forEach { line ->
-                            val v = line.split(',')
+                            val v = splitCsv(line)
                             if (v.size >= 8) {
-                                val type = runCatching { com.patipan.tripmap.tracking.JunctionType.valueOf(v[3]) }.getOrDefault(com.patipan.tripmap.tracking.JunctionType.THREE_WAY)
-                                val side = runCatching { com.patipan.tripmap.tracking.JunctionSide.valueOf(v[4]) }.getOrDefault(com.patipan.tripmap.tracking.JunctionSide.RIGHT)
-                                val source = runCatching { com.patipan.tripmap.tracking.JunctionSource.valueOf(v[5]) }.getOrDefault(com.patipan.tripmap.tracking.JunctionSource.MANUAL)
-                                junctions += JunctionPoint(v[0].toLong(), v[1].toDouble(), v[2].toDouble(), type, side, source, v[6].toDouble(), v[7].toLong())
+                                val type = runCatching { JunctionType.valueOf(v[3]) }.getOrDefault(JunctionType.THREE_WAY)
+                                val side = runCatching { JunctionSide.valueOf(v[4]) }.getOrDefault(JunctionSide.RIGHT)
+                                val source = runCatching { JunctionSource.valueOf(v[5]) }.getOrDefault(JunctionSource.MANUAL)
+                                junctions += JunctionPoint(
+                                    id = v[0].toLong(), latitude = v[1].toDouble(), longitude = v[2].toDouble(),
+                                    type = type, side = side, source = source,
+                                    nearestChainageMeters = v[6].toDouble(), timestamp = v[7].toLong(),
+                                    note = v.getOrNull(8)?.takeIf { it.isNotEmpty() }.orEmpty(),
+                                    lanes = v.getOrNull(9)?.toIntOrNull(),
+                                    widthMeters = v.getOrNull(10)?.toDoubleOrNull(),
+                                    shoulderMeters = v.getOrNull(11)?.toDoubleOrNull(),
+                                    surface = v.getOrNull(12)?.takeIf { it.isNotEmpty() } ?: com.patipan.tripmap.data.SurfaceKind.UNKNOWN,
+                                    photoRef = v.getOrNull(13)?.takeIf { it.isNotEmpty() }
+                                )
+                            }
+                        }
+                        "road_segments.csv" -> text.lineSequence().drop(1).forEach { line ->
+                            val v = splitCsv(line)
+                            if (v.size >= 9) {
+                                segments += RoadSegment(
+                                    name = v[0], startChainageMeters = v[1].toInt(), endChainageMeters = v[2].toInt(),
+                                    lanes = v[3].toInt(), widthMeters = v[4].toDoubleOrNull(),
+                                    shoulderMeters = v[5].toDoubleOrNull(),
+                                    surface = v[6].takeIf { it.isNotEmpty() } ?: com.patipan.tripmap.data.SurfaceKind.UNKNOWN,
+                                    note = v[7], colorIndex = v[8].toInt()
+                                )
                             }
                         }
                     }
@@ -119,11 +168,11 @@ object TripArchive {
             startChainageMeters = p.getProperty("startChainageMeters", "0").toInt(),
             chainageDirection = p.getProperty("chainageDirection", "LT")
         )
-        return ImportedTrip(trip, points, junctions)
+        return ImportedTrip(trip, points, junctions, segments)
     }
 
     fun insertIntoDatabase(context: Context, imported: ImportedTrip): Long {
-        val dao = (context.applicationContext as com.patipan.tripmap.TripMapApplication).database.tripDao()
+        val dao = (context.applicationContext as TripMapApplication).database.tripDao()
         var id = 0L
         kotlinx.coroutines.runBlocking {
             id = dao.insertTrip(imported.trip)
@@ -131,9 +180,47 @@ object TripArchive {
                 TrackPointEntity(0, id, index, p.latitude, p.longitude, p.accuracyMeters, p.timestamp, p.chainageMeters)
             })
             if (imported.junctions.isNotEmpty()) dao.insertJunctions(imported.junctions.map { j ->
-                JunctionEntity(0, id, j.latitude, j.longitude, j.type.name, j.side.name, j.source.name, j.nearestChainageMeters, j.timestamp)
+                JunctionEntity(
+                    0, id, j.latitude, j.longitude, j.type.name, j.side.name, j.source.name,
+                    j.nearestChainageMeters, j.timestamp,
+                    note = j.note, lanes = j.lanes, widthMeters = j.widthMeters,
+                    shoulderMeters = j.shoulderMeters, surface = j.surface, photoRef = j.photoRef
+                )
             })
+            if (imported.roadSegments.isNotEmpty()) imported.roadSegments.forEach { s ->
+                dao.insertSegment(RoadSegmentEntity(
+                    0, id, s.name, s.startChainageMeters, s.endChainageMeters, s.lanes,
+                    s.widthMeters, s.shoulderMeters, s.surface, s.note, s.colorIndex,
+                    s.createdAt, s.updatedAt
+                ))
+            }
         }
         return id
+    }
+
+    /** escape ค่าที่มี comma, quote หรือขึ้นบรรทัดใหม่ เพื่อไม่ให้ CSV แตกคอลัมน์ */
+    private fun csvText(value: String): String =
+        if (value.any { it == ',' || it == '"' || it == '\n' || it == '\r' }) {
+            "\"" + value.replace("\"", "\"\"") + "\""
+        } else value
+
+    /** split CSV ที่รองรับค่าที่ถูกครอบด้วย " และ "" escape */
+    private fun splitCsv(line: String): List<String> {
+        val out = mutableListOf<String>()
+        val sb = StringBuilder()
+        var inQuotes = false
+        var i = 0
+        while (i < line.length) {
+            val c = line[i]
+            when {
+                c == '"' && inQuotes && i + 1 < line.length && line[i + 1] == '"' -> { sb.append('"'); i++ }
+                c == '"' -> inQuotes = !inQuotes
+                c == ',' && !inQuotes -> { out.add(sb.toString()); sb.setLength(0) }
+                else -> sb.append(c)
+            }
+            i++
+        }
+        out.add(sb.toString())
+        return out
     }
 }

@@ -115,7 +115,6 @@ class TripViewModel(application: Application) : AndroidViewModel(application) {
             mutableNotice.value = "ช่วงต้องยาวอย่างน้อย 1 เมตร"
             return
         }
-        // ตรวจกับ entity ใน Room โดยตรง — ไม่ต้องแปลงเป็น domain เพราะต้องการแค่ name กับ id
         val existing = mutableSelectedTrip.value?.roadSegments.orEmpty()
         val conflicts = existing.filter {
             it.id != segment.id &&
@@ -173,9 +172,10 @@ class TripViewModel(application: Application) : AndroidViewModel(application) {
                 TrackPoint(it.latitude, it.longitude, it.accuracyMeters, it.timestamp, it.chainageMeters)
             }
             val junctions = data.junctions.map { it.toDomain() }
+            val segments = data.roadSegments.map { it.toDomain() }
             runCatching {
                 withContext(Dispatchers.IO) {
-                    TripArchive.write(context, uri, data.trip, points, junctions)
+                    TripArchive.write(context, uri, data.trip, points, junctions, segments)
                 }
             }.onSuccess {
                 mutableExportMessage.value = "บันทึกไฟล์ทริปเรียบร้อยแล้ว"

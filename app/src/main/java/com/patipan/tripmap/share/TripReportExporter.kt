@@ -5,13 +5,8 @@ import android.content.Intent
 import android.graphics.*
 import android.graphics.pdf.PdfDocument
 import androidx.core.content.FileProvider
-import com.patipan.tripmap.tracking.TrackPoint
-import com.patipan.tripmap.tracking.StartChainageConfig
-import com.patipan.tripmap.tracking.JunctionPoint
-import com.patipan.tripmap.tracking.JunctionType
-import com.patipan.tripmap.tracking.JunctionSide
-import com.patipan.tripmap.tracking.JunctionSource
 import com.patipan.tripmap.dxf.DxfExporter
+import com.patipan.tripmap.tracking.*
 import java.io.File
 import java.io.FileOutputStream
 import java.util.zip.ZipEntry
@@ -35,7 +30,9 @@ data class TripReport(
     val name: String = "",
     val startChainage: StartChainageConfig = StartChainageConfig(),
     val junctions: List<JunctionPoint> = emptyList(),
-    val selection: ExportSelection = ExportSelection()
+    val roadSegments: List<RoadSegment> = emptyList(),
+    val selection: ExportSelection = ExportSelection(),
+    val dxfOptions: DxfExporter.Options = DxfExporter.Options()
 )
 
 object TripReportExporter {
@@ -47,7 +44,16 @@ object TripReportExporter {
             ReportFormat.PNG -> File(dir, "$safeBase.png").also { writePng(it, prepared) }
             ReportFormat.PDF -> File(dir, "$safeBase.pdf").also { writePdf(it, prepared) }
             ReportFormat.KMZ -> File(dir, "$safeBase.kmz").also { writeKmz(it, prepared) }
-            ReportFormat.DXF -> DxfExporter.export(context, prepared.points, prepared.junctions, prepared.startChainage, "$safeBase.dxf", intervalMeters = prepared.selection.intervalMeters).file
+            ReportFormat.DXF -> DxfExporter.export(
+                context = context,
+                points = prepared.points,
+                junctions = prepared.junctions,
+                startChainage = prepared.startChainage,
+                fileName = "$safeBase.dxf",
+                roadSegments = prepared.roadSegments,
+                options = prepared.dxfOptions,
+                intervalMeters = prepared.selection.intervalMeters
+            ).file
         }
         val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
         val mime = when (format) {
@@ -73,7 +79,16 @@ object TripReportExporter {
         val end = report.selection.endRouteMeters.coerceIn(start, max)
         val points = slicePoints(report.points, start.toDouble(), end.toDouble())
         val junctions = report.junctions.filter { it.nearestChainageMeters in start.toDouble()..end.toDouble() }
-        return report.copy(points = points, junctions = junctions, selection = report.selection.copy(startRouteMeters = start, endRouteMeters = end))
+        // เก็บเฉพาะช่วงที่ทับซ้อนกับขอบเขตที่เลือก — ช่วงที่อยู่นอกขอบเขตไม่เกี่ยวกับกับ export ครั้งนี้
+        val segments = report.roadSegments.filter {
+            it.startChainageMeters <= end && it.endChainageMeters >= start
+        }
+        return report.copy(
+            points = points,
+            junctions = junctions,
+            roadSegments = segments,
+            selection = report.selection.copy(startRouteMeters = start, endRouteMeters = end)
+        )
     }
 
     private fun slicePoints(points: List<TrackPoint>, start: Double, end: Double): List<TrackPoint> {
@@ -117,7 +132,7 @@ object TripReportExporter {
         FileOutputStream(file).use(document::writeTo); document.close()
     }
 
-    /** Google Earth KMZ: the original GPS track plus chainage pins every 100 metres, and any junction points. */
+    /** Google Earth KMZ: เส้นทาง + ป้าย กม. ตามช่วงที่เลือก + จุดทางแยกพร้อมคุณสมบัติถนน */
     private fun writeKmz(file: File, report: TripReport) {
         val points = report.points
         fun escape(value: String) = value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -131,18 +146,38 @@ object TripReportExporter {
         }
         val junctionPins = buildString {
             report.junctions.forEach { j ->
-                val typeLabel = if (j.type == JunctionType.THREE_WAY) "3-way" else "4-way"
+                val attrs = j.effective(report.roadSegments)
+                val typeLabel = j.type.label()
                 val sideLabel = when (j.side) { JunctionSide.LEFT -> "left"; JunctionSide.RIGHT -> "right"; JunctionSide.BOTH -> "both" }
                 val sourceLabel = if (j.source == JunctionSource.OSM) "osm" else "manual"
-                val chainageLabel = escape(label((j.nearestChainageMeters).toInt()))
+                val chainageLabel = escape(label(j.nearestChainageMeters.toInt()))
                 append("<Placemark><name>${escape(typeLabel)} ($chainageLabel)</name><styleUrl>#junction</styleUrl>")
                 append("<ExtendedData>")
-                append("<Data name=\"junction_type\"><value>$typeLabel</value></Data>")
+                append("<Data name=\"junction_type\"><value>${escape(typeLabel)}</value></Data>")
                 append("<Data name=\"branch_side\"><value>$sideLabel</value></Data>")
                 append("<Data name=\"source\"><value>$sourceLabel</value></Data>")
                 append("<Data name=\"nearest_chainage\"><value>${escape(chainageLabel)}</value></Data>")
+                append("<Data name=\"road_attrs\"><value>${escape(attrs.summary())}</value></Data>")
+                j.note.takeIf { it.isNotBlank() }?.let {
+                    append("<Data name=\"note\"><value>${escape(it)}</value></Data>")
+                }
                 append("</ExtendedData>")
                 append("<Point><coordinates>${j.longitude},${j.latitude},0</coordinates></Point></Placemark>")
+            }
+        }
+        val segmentPins = buildString {
+            report.roadSegments.forEach { s ->
+                val mid = report.points.minByOrNull { abs(it.chainageMeters - (s.startChainageMeters + s.endChainageMeters) / 2.0) } ?: return@forEach
+                append("<Placemark><name>${escape(s.name.ifBlank { "ช่วง" })}</name><styleUrl>#segment</styleUrl>")
+                append("<ExtendedData>")
+                append("<Data name=\"road_segment\"><value>${escape(s.name.ifBlank { "ช่วง" })}</value></Data>")
+                append("<Data name=\"length_m\"><value>${s.lengthMeters}</value></Data>")
+                append("<Data name=\"attributes\"><value>${escape(s.attributes().summary())}</value></Data>")
+                s.note.takeIf { it.isNotBlank() }?.let {
+                    append("<Data name=\"note\"><value>${escape(it)}</value></Data>")
+                }
+                append("</ExtendedData>")
+                append("<Point><coordinates>${mid.longitude},${mid.latitude},0</coordinates></Point></Placemark>")
             }
         }
         val coordinates = points.joinToString(" ") { "${it.longitude},${it.latitude},0" }
@@ -152,9 +187,11 @@ object TripReportExporter {
 <Style id="route"><LineStyle><color>ffff8000</color><width>6</width></LineStyle></Style>
 <Style id="chainage"><IconStyle><scale>1.1</scale></IconStyle></Style>
 <Style id="junction"><IconStyle><color>ff0080ff</color><scale>1.2</scale></IconStyle></Style>
+<Style id="segment"><IconStyle><color>ff2d865e</color><scale>1.3</scale></IconStyle></Style>
 <Placemark><name>เส้นทางจริง</name><styleUrl>#route</styleUrl><LineString><tessellate>1</tessellate><coordinates>$coordinates</coordinates></LineString></Placemark>
 <Folder><name>หลัก กม. ตามช่วงที่เลือก (${report.startChainage.direction.name})</name>$pins</Folder>
 ${if (report.junctions.isNotEmpty()) "<Folder><name>ทางแยก</name>$junctionPins</Folder>" else ""}
+${if (report.roadSegments.isNotEmpty()) "<Folder><name>ช่วงของถนน</name>$segmentPins</Folder>" else ""}
 </Document></kml>"""
         ZipOutputStream(FileOutputStream(file)).use { zip ->
             zip.putNextEntry(ZipEntry("doc.kml")); zip.write(kml.toByteArray(Charsets.UTF_8)); zip.closeEntry()
@@ -171,18 +208,18 @@ ${if (report.junctions.isNotEmpty()) "<Folder><name>ทางแยก</name>$ju
     private fun drawPage(canvas: Canvas, report: TripReport, section: IntRange, yOffset: Int, height: Int, includeHeader: Boolean) {
         canvas.save(); canvas.translate(0f, yOffset.toFloat())
         val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { typeface = Typeface.create("sans", Typeface.NORMAL) }
-        fun text(value: String, x: Float, y: Float, size: Float, color: Int, bold: Boolean = false) {
+        fun drawText(value: String, x: Float, y: Float, size: Float, color: Int, bold: Boolean = false) {
             paint.style = Paint.Style.FILL; paint.textSize = size; paint.color = color
             paint.typeface = Typeface.create("sans", if (bold) Typeface.BOLD else Typeface.NORMAL)
             canvas.drawText(value, x, y, paint)
         }
-        text(report.name.ifBlank { "Trip Map — รายงานทริป" }, 64f, 72f, 42f, Color.rgb(44,44,43), true)
-        text("ช่วง ${chainage(report.startChainage.displayMeters(section.first.toDouble()).toDouble(), report.startChainage.direction.name)} – ${chainage(report.startChainage.displayMeters(section.last.toDouble()).toDouble(), report.startChainage.direction.name)}", 64f, 116f, 27f, Color.DKGRAY)
-        if (includeHeader) text("ระยะสุทธิ %.2f กม.   ระยะเคลื่อนที่รวม %.2f กม.".format(report.netDistanceMeters/1000, report.traveledDistanceMeters/1000), 64f, 154f, 24f, Color.DKGRAY)
+        drawText(report.name.ifBlank { "Trip Map — รายงานทริป" }, 64f, 72f, 42f, Color.rgb(44,44,43), true)
+        drawText("ช่วง ${chainage(report.startChainage.displayMeters(section.first.toDouble()).toDouble(), report.startChainage.direction.name)} – ${chainage(report.startChainage.displayMeters(section.last.toDouble()).toDouble(), report.startChainage.direction.name)}", 64f, 116f, 27f, Color.DKGRAY)
+        if (includeHeader) drawText("ระยะสุทธิ %.2f กม.   ระยะเคลื่อนที่รวม %.2f กม.".format(report.netDistanceMeters/1000, report.traveledDistanceMeters/1000), 64f, 154f, 24f, Color.DKGRAY)
         val bounds = RectF(64f, 190f, 1016f, (height - 110).toFloat())
         paint.color = Color.rgb(244,246,243); canvas.drawRoundRect(bounds, 20f, 20f, paint)
         drawRoute(canvas, report.points.filter { it.chainageMeters.toInt() in section }, bounds, paint, report.startChainage, section, report.selection.intervalMeters)
-        text("ป้ายตามช่วงที่เลือก · สลับบน/ล่างพร้อมเส้นโยง", 64f, (height - 55).toFloat(), 22f, Color.GRAY)
+        drawText("ป้ายตามช่วงที่เลือก · สลับบน/ล่างพร้อมเส้นโยง", 64f, (height - 55).toFloat(), 22f, Color.GRAY)
         canvas.restore()
     }
 
