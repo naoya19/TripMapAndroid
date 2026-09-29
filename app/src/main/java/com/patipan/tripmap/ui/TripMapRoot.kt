@@ -1,10 +1,13 @@
 package com.patipan.tripmap.ui
 
 import android.content.Context
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
@@ -14,6 +17,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.google.android.gms.maps.CameraUpdateFactory
 import com.google.android.gms.maps.model.CameraPosition
@@ -104,6 +108,7 @@ private fun TripScreen(
     val context = LocalContext.current
     var diagnosticsOpen by remember { mutableStateOf(false) }
     var settingsOpen by remember { mutableStateOf(false) }
+    var panelOpen by remember { mutableStateOf(false) }
     var configuredStart by remember { mutableStateOf(StartChainageConfig()) }
     var configuredVoice by remember { mutableStateOf(VoiceMode.THAI) }
     var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
@@ -111,53 +116,211 @@ private fun TripScreen(
         while (state.isTracking) { now = System.currentTimeMillis(); delay(1_000) }
     }
     val elapsed = state.startedAt?.let { (now - it).coerceAtLeast(0) } ?: 0L
+    val active = activeConfig(state, configuredStart)
 
-    Column(modifier.fillMaxSize()) {
-        Surface(tonalElevation = 1.dp) {
-            Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-                Column(Modifier.weight(1f)) {
-                    Text("Trip Map", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-                    Text("จับระยะสุทธิตามแนวเส้นทาง", style = MaterialTheme.typography.bodySmall)
-                }
-                AssistChip(onClick = {}, label = {
-                    Text(if (state.accuracyMeters == null) "รอ GPS" else "GPS ±${state.accuracyMeters.toInt()} ม.")
-                })
-                IconButton({ settingsOpen = true }) { Icon(Icons.Default.Settings, "ตั้งค่าจุดเริ่มและเสียง") }
-                IconButton({ diagnosticsOpen = true }) {
-                    Icon(Icons.Default.Info, "ตรวจสอบ Maps API")
-                }
+    Box(modifier.fillMaxSize()) {
+
+        // ---------- แผนที่เต็มพื้นที่ ----------
+        RealtimeMap(
+            state.points, state.junctions, locationGranted, active,
+            bottomInset = if (panelOpen) 336.dp else 112.dp,
+            onAddJunction = TrackingBus::addJunction,
+            onRemoveJunction = TrackingBus::removeJunction
+        )
+
+        // ---------- HUD ทับบนแผนที่ ----------
+        Column(
+            Modifier.align(Alignment.TopCenter).fillMaxWidth().padding(horizontal = 10.dp, vertical = 10.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                HudChainage(
+                    label = chainageLabel(active.displayMeters(state.chainageMeters), active.direction),
+                    sub = "ระยะสุทธิ",
+                    tracking = state.isTracking,
+                    modifier = Modifier.weight(1f)
+                )
+                HudIconButton(Icons.Default.Settings, "ตั้งค่าจุดเริ่มและเสียง") { settingsOpen = true }
+                HudIconButton(Icons.Default.Info, "ตรวจสอบ Maps API") { diagnosticsOpen = true }
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                Stat(
+                    "GPS",
+                    if (state.accuracyMeters == null) "รอ" else "±${state.accuracyMeters.toInt()} ม.",
+                    Modifier.weight(1f), hud = true
+                )
+                Stat(
+                    "เคลื่อนที่รวม",
+                    "%.2f กม.".format(state.traveledDistanceMeters / 1000),
+                    Modifier.weight(1.4f), hud = true
+                )
+                Stat(
+                    "ความเร็ว",
+                    "%.1f กม./ชม.".format(state.speedKmh),
+                    Modifier.weight(1.3f), hud = true
+                )
+                Stat("เวลา", durationText(elapsed), Modifier.weight(1f), hud = true)
             }
         }
 
-        Box(Modifier.weight(1f)) {
-            RealtimeMap(state.points, state.junctions, locationGranted, activeConfig(state, configuredStart), onAddJunction = TrackingBus::addJunction, onRemoveJunction = TrackingBus::removeJunction)
-            Card(Modifier.padding(12.dp).align(Alignment.TopStart)) {
-                Column(Modifier.padding(horizontal = 12.dp, vertical = 9.dp)) {
-                    val active = activeConfig(state, configuredStart)
-                    Text(chainageLabel(active.displayMeters(state.chainageMeters), active.direction), fontWeight = FontWeight.Bold)
-                    Text("ระยะสุทธิ", style = MaterialTheme.typography.labelSmall)
-                }
+        // ---------- แผงล่าง ----------
+        Column(Modifier.align(Alignment.BottomCenter).fillMaxWidth()) {
+            AnimatedVisibility(visible = panelOpen) {
+                ExtraPanel(state = state, context = context)
+            }
+            MainBar(
+                isTracking = state.isTracking,
+                locationGranted = locationGranted,
+                panelOpen = panelOpen,
+                voiceLabel = voiceModeLabel(if (state.isTracking) state.voiceMode else configuredVoice),
+                onTogglePanel = { panelOpen = !panelOpen },
+                onRequestPermissions = requestPermissions,
+                onStartStop = { if (state.isTracking) stopTrip() else startTrip(configuredStart, configuredVoice) }
+            )
+        }
+    }
+
+    if (settingsOpen) ChainageSettingsDialog(configuredStart, configuredVoice, { settingsOpen = false }) { start, voice ->
+        configuredStart = start; configuredVoice = voice; settingsOpen = false
+    }
+    if (diagnosticsOpen) MapsDiagnosticsDialog(context) { diagnosticsOpen = false }
+}
+
+@Composable
+private fun HudSurface(modifier: Modifier = Modifier, onClick: (() -> Unit)? = null, content: @Composable () -> Unit) {
+    Surface(
+        modifier = if (onClick != null) modifier.clickable { onClick() } else modifier,
+        shape = RoundedCornerShape(14.dp),
+        color = Color.White.copy(alpha = 0.94f),
+        shadowElevation = 3.dp
+    ) { content() }
+}
+
+@Composable
+private fun HudChainage(label: String, sub: String, tracking: Boolean, modifier: Modifier = Modifier) {
+    HudSurface(modifier) {
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Box(
+                Modifier.size(9.dp).background(
+                    if (tracking) Color(0xFF2D865E) else Color(0xFFBDBDB8),
+                    RoundedCornerShape(50)
+                )
+            )
+            Spacer(Modifier.width(8.dp))
+            Column(Modifier.weight(1f)) {
+                Text(label, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleMedium, maxLines = 1)
+                Text(sub, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline, maxLines = 1)
             }
         }
+    }
+}
 
-        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(9.dp)) {
-            Surface(color = if (state.isTracking) Color(0xFFE8F1EC) else Color(0xFFF0EFED), shape = MaterialTheme.shapes.small) {
-                Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Text(if (state.isTracking) "●" else "○", color = if (state.isTracking) Color(0xFF2D865E) else Color.Gray)
+@Composable
+private fun HudIconButton(icon: androidx.compose.ui.graphics.vector.ImageVector, description: String, onClick: () -> Unit) {
+    HudSurface(onClick = onClick) {
+        Box(Modifier.size(44.dp), contentAlignment = Alignment.Center) {
+            Icon(icon, description, tint = MaterialTheme.colorScheme.onSurface, modifier = Modifier.size(20.dp))
+        }
+    }
+}
+
+@Composable
+private fun MainBar(
+    isTracking: Boolean,
+    locationGranted: Boolean,
+    panelOpen: Boolean,
+    voiceLabel: String,
+    onTogglePanel: () -> Unit,
+    onRequestPermissions: () -> Unit,
+    onStartStop: () -> Unit
+) {
+    Surface(
+        shape = RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp),
+        color = MaterialTheme.colorScheme.surface,
+        shadowElevation = 10.dp
+    ) {
+        Column(
+            Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            Box(
+                Modifier.fillMaxWidth().clickable { onTogglePanel() },
+                contentAlignment = Alignment.Center
+            ) {
+                Box(Modifier.size(width = 36.dp, height = 4.dp).background(Color(0xFFBDBDB8), RoundedCornerShape(50)))
+            }
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth().clickable { onTogglePanel() }
+            ) {
+                Icon(
+                    if (panelOpen) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                    if (panelOpen) "ซ่อนเครื่องมือ" else "แสดงเครื่องมือ",
+                    modifier = Modifier.size(20.dp),
+                    tint = MaterialTheme.colorScheme.outline
+                )
+                Spacer(Modifier.width(6.dp))
+                Text(voiceLabel, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary, modifier = Modifier.weight(1f))
+                Text(
+                    if (panelOpen) "ซ่อน" else "เครื่องมือ",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.outline
+                )
+            }
+            if (!locationGranted) {
+                Button(
+                    onRequestPermissions,
+                    Modifier.fillMaxWidth().height(52.dp),
+                    shape = RoundedCornerShape(14.dp)
+                ) { Text("อนุญาตตำแหน่ง GPS") }
+            } else {
+                Button(
+                    onClick = onStartStop,
+                    modifier = Modifier.fillMaxWidth().height(52.dp),
+                    shape = RoundedCornerShape(14.dp),
+                    colors = if (isTracking) ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error) else ButtonDefaults.buttonColors()
+                ) {
+                    Icon(if (isTracking) Icons.Default.Stop else Icons.Default.PlayArrow, null)
                     Spacer(Modifier.width(8.dp))
-                    Column(Modifier.weight(1f)) {
-                        Text(if (state.isTracking) "REAL-TIME • กำลังลากเส้นตำแหน่ง" else "พร้อมเริ่มทริป", fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.bodySmall)
-                        val latest = state.points.lastOrNull()
-                        Text(latest?.let { "${"%.6f".format(it.latitude)}, ${"%.6f".format(it.longitude)}" } ?: "ยังไม่มีตำแหน่ง", style = MaterialTheme.typography.labelSmall)
-                    }
+                    Text(if (isTracking) "หยุดและบันทึกทริป" else "เริ่มทริป")
                 }
             }
+        }
+    }
+}
 
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                Stat("ระยะสุทธิ", "%.2f กม.".format(state.chainageMeters / 1000), Modifier.weight(1f))
-                Stat("เคลื่อนที่รวม", "%.2f กม.".format(state.traveledDistanceMeters / 1000), Modifier.weight(1f))
-                Stat("ความเร็ว", "%.1f กม./ชม.".format(state.speedKmh), Modifier.weight(1f))
-                Stat("เวลา", durationText(elapsed), Modifier.weight(1f))
+@Composable
+private fun ExtraPanel(state: TrackingState, context: Context) {
+    var osmSyncing by remember { mutableStateOf(false) }
+    var osmMessage by remember { mutableStateOf<String?>(null) }
+    val scope = rememberCoroutineScope()
+    Surface(
+        Modifier.fillMaxWidth().padding(horizontal = 10.dp),
+        shape = RoundedCornerShape(18.dp),
+        color = MaterialTheme.colorScheme.surface,
+        shadowElevation = 6.dp
+    ) {
+        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(9.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(if (state.isTracking) "●" else "○", color = if (state.isTracking) Color(0xFF2D865E) else Color.Gray)
+                Spacer(Modifier.width(8.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        if (state.isTracking) "REAL-TIME • กำลังลากเส้นตำแหน่ง" else "พร้อมเริ่มทริป",
+                        fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.bodySmall
+                    )
+                    val latest = state.points.lastOrNull()
+                    Text(
+                        latest?.let { "${"%.6f".format(it.latitude)}, ${"%.6f".format(it.longitude)}" } ?: "ยังไม่มีตำแหน่ง",
+                        style = MaterialTheme.typography.labelSmall
+                    )
+                }
             }
 
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -165,21 +328,9 @@ private fun TripScreen(
                 Spacer(Modifier.width(6.dp))
                 Column(Modifier.weight(1f)) {
                     Text(state.ttsStatus, style = MaterialTheme.typography.bodySmall)
-                    state.lastSpokenText?.let { Text("ล่าสุด: $it", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary) }
-                }
-                Text(voiceModeLabel(if (state.isTracking) state.voiceMode else configuredVoice), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
-            }
-
-            if (!locationGranted) {
-                Button(requestPermissions, Modifier.fillMaxWidth()) { Text("อนุญาตตำแหน่ง GPS") }
-            } else {
-                Button(
-                    onClick = { if (state.isTracking) stopTrip() else startTrip(configuredStart, configuredVoice) },
-                    Modifier.fillMaxWidth(),
-                    colors = if (state.isTracking) ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error) else ButtonDefaults.buttonColors()
-                ) {
-                    Icon(if (state.isTracking) Icons.Default.Stop else Icons.Default.PlayArrow, null)
-                    Spacer(Modifier.width(8.dp)); Text(if (state.isTracking) "หยุดและบันทึกทริป" else "เริ่มทริป")
+                    state.lastSpokenText?.let {
+                        Text("ล่าสุด: $it", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
+                    }
                 }
             }
 
@@ -191,9 +342,6 @@ private fun TripScreen(
             }
 
             if (state.points.size > 1) {
-                var osmSyncing by remember { mutableStateOf(false) }
-                var osmMessage by remember { mutableStateOf<String?>(null) }
-                val scope = rememberCoroutineScope()
                 OutlinedButton(
                     onClick = {
                         osmSyncing = true; osmMessage = null
@@ -221,14 +369,12 @@ private fun TripScreen(
                     Spacer(Modifier.width(8.dp))
                     Text(if (osmSyncing) "กำลังดึงทางแยกจาก OSM…" else "ดึงทางแยกจาก OSM")
                 }
-                osmMessage?.let { Text(it, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline) }
+                osmMessage?.let {
+                    Text(it, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline)
+                }
             }
         }
     }
-    if (settingsOpen) ChainageSettingsDialog(configuredStart, configuredVoice, { settingsOpen = false }) { start, voice ->
-        configuredStart = start; configuredVoice = voice; settingsOpen = false
-    }
-    if (diagnosticsOpen) MapsDiagnosticsDialog(context) { diagnosticsOpen = false }
 }
 
 private fun activeConfig(state: TrackingState, configured: StartChainageConfig) = if (state.isTracking || state.points.size > 1) state.startChainage else configured
@@ -308,8 +454,17 @@ private fun ShareButton(onClick: () -> Unit, icon: androidx.compose.ui.graphics.
 }
 
 @Composable
-private fun RealtimeMap(points: List<TrackPoint>, junctions: List<JunctionPoint>, locationGranted: Boolean, config: StartChainageConfig, onAddJunction: (JunctionPoint) -> Unit, onRemoveJunction: (Long) -> Unit) {
-    val coordinates = points.map { LatLng(it.latitude, it.longitude) }
+private fun RealtimeMap(
+    points: List<TrackPoint>,
+    junctions: List<JunctionPoint>,
+    locationGranted: Boolean,
+    config: StartChainageConfig,
+    bottomInset: Dp = 12.dp,
+    onAddJunction: (JunctionPoint) -> Unit,
+    onRemoveJunction: (Long) -> Unit
+) {
+    val polylinePoints = remember(points) { decimatePoints(points) }
+    val coordinates = remember(polylinePoints) { polylinePoints.map { LatLng(it.latitude, it.longitude) } }
     val camera = rememberCameraPositionState {
         position = CameraPosition.fromLatLngZoom(LatLng(13.7563, 100.5018), 11f)
     }
@@ -319,8 +474,15 @@ private fun RealtimeMap(points: List<TrackPoint>, junctions: List<JunctionPoint>
     var previewMeters by remember(points) { mutableFloatStateOf(points.maxOfOrNull { it.chainageMeters.toFloat() } ?: 0f) }
     var pendingJunctionLatLng by remember { mutableStateOf<LatLng?>(null) }
     var pendingDeleteJunction by remember { mutableStateOf<JunctionPoint?>(null) }
+    val maxChainage = remember(points) { points.maxOfOrNull { it.chainageMeters.toFloat() } ?: 0f }
 
-    LaunchedEffect(mapLoaded, coordinates.size, follow) {
+    val interval = if (detailMode) 100 else 1_000
+    val selectedKm = if (detailMode) previewMeters.toInt() / 1_000 else null
+    val markers = remember(points, interval, config, selectedKm) {
+        chainageMarkers(points, interval, config, selectedKm)
+    }
+
+    LaunchedEffect(mapLoaded, points.size, follow) {
         if (mapLoaded && follow && coordinates.isNotEmpty()) {
             camera.animate(CameraUpdateFactory.newLatLngZoom(coordinates.last(), 18f), 500)
         }
@@ -339,13 +501,22 @@ private fun RealtimeMap(points: List<TrackPoint>, junctions: List<JunctionPoint>
             if (coordinates.size > 1) {
                 Polyline(points = coordinates, color = Color(0xFF2783DE), width = 14f, zIndex = 10f, geodesic = true)
             }
-            val markers = chainageMarkers(points, if (detailMode) 100 else 1_000, config, if (detailMode) previewMeters.toInt() / 1_000 else null)
             markers.forEachIndexed { index, marker ->
-                Marker(state = MarkerState(LatLng(marker.point.latitude, marker.point.longitude)), title = chainageLabel(marker.displayMeters, config.direction), icon = chainageIcon(chainageLabel(marker.displayMeters, config.direction), index % 2 == 0), anchor = androidx.compose.ui.geometry.Offset(0.5f, 0.5f), zIndex = 15f)
+                val labelText = chainageLabel(marker.displayMeters, config.direction)
+                val above = index % 2 == 0
+                Marker(
+                    state = remember(marker.point) {
+                        MarkerState(LatLng(marker.point.latitude, marker.point.longitude))
+                    },
+                    title = labelText,
+                    icon = remember(labelText, above) { chainageIconCached(labelText, above) },
+                    anchor = androidx.compose.ui.geometry.Offset(0.5f, 0.5f),
+                    zIndex = 15f
+                )
             }
             junctions.forEach { junction ->
                 Marker(
-                    state = MarkerState(LatLng(junction.latitude, junction.longitude)),
+                    state = remember(junction.id) { MarkerState(LatLng(junction.latitude, junction.longitude)) },
                     title = junctionLabel(junction),
                     snippet = if (junction.source == JunctionSource.OSM) "จาก OSM · แตะเพื่อลบ" else "แตะระบุเอง · แตะเพื่อลบ",
                     icon = BitmapDescriptorFactory.defaultMarker(BitmapDescriptorFactory.HUE_ORANGE),
@@ -354,15 +525,23 @@ private fun RealtimeMap(points: List<TrackPoint>, junctions: List<JunctionPoint>
                 )
             }
             coordinates.lastOrNull()?.let {
-                Marker(state = MarkerState(it), title = "ตำแหน่ง Real-time", icon = BitmapDescriptorFactory.defaultMarker(BitmapDescriptorFactory.HUE_AZURE), zIndex = 20f)
+                Marker(
+                    state = remember(it) { MarkerState(it) },
+                    title = "ตำแหน่ง Real-time",
+                    icon = BitmapDescriptorFactory.defaultMarker(BitmapDescriptorFactory.HUE_AZURE),
+                    zIndex = 20f
+                )
             }
         }
         FloatingActionButton(
             onClick = { follow = true },
-            modifier = Modifier.align(Alignment.BottomEnd).padding(12.dp),
+            modifier = Modifier.align(Alignment.BottomEnd).padding(end = 12.dp, bottom = bottomInset),
             containerColor = Color.White
         ) { Icon(Icons.Default.MyLocation, "ติดตามตำแหน่ง") }
-        Surface(Modifier.align(Alignment.BottomStart).padding(12.dp), shape = MaterialTheme.shapes.medium, tonalElevation = 3.dp) {
+        Surface(
+            Modifier.align(Alignment.BottomStart).padding(start = 12.dp, bottom = bottomInset),
+            shape = MaterialTheme.shapes.medium, tonalElevation = 3.dp
+        ) {
             Column(Modifier.padding(10.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     FilterChip(!detailMode, { detailMode = false }, label = { Text("ภาพรวม · ทุก 1 กม.") })
@@ -371,7 +550,7 @@ private fun RealtimeMap(points: List<TrackPoint>, junctions: List<JunctionPoint>
                 }
                 if (detailMode) {
                     Text("เลื่อนเพื่อเลือกช่วง กม. ${(previewMeters / 1000).toInt()}", style = MaterialTheme.typography.labelSmall)
-                    Slider(previewMeters, { previewMeters = it }, valueRange = 0f..(points.maxOfOrNull { it.chainageMeters.toFloat() }?.coerceAtLeast(1f) ?: 1f), enabled = points.size > 1)
+                    Slider(previewMeters, { previewMeters = it }, valueRange = 0f..maxChainage.coerceAtLeast(1f), enabled = points.size > 1)
                 }
                 Text("แตะค้างบนแผนที่เพื่อเพิ่มจุดทางแยก", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline)
             }
@@ -403,6 +582,18 @@ private fun RealtimeMap(points: List<TrackPoint>, junctions: List<JunctionPoint>
             onConfirm = { onRemoveJunction(junction.id); pendingDeleteJunction = null }
         )
     }
+}
+
+/** ลดจำนวนจุดที่ส่งให้ Google Maps วาดเส้น เพื่อให้แผนที่ลื่นเมื่อทริปยาว — ข้อมูลเต็มยังอยู่ใน Room ครบ */
+private fun decimatePoints(points: List<TrackPoint>, maxPoints: Int = 600): List<TrackPoint> {
+    if (points.size <= maxPoints) return points
+    val step = ((points.size + maxPoints - 1) / maxPoints).coerceAtLeast(1)
+    val out = ArrayList<TrackPoint>(maxPoints + 1)
+    var i = 0
+    while (i < points.size) { out.add(points[i]); i += step }
+    val last = points[points.size - 1]
+    if (out[out.size - 1] !== last) out.add(last)
+    return out
 }
 
 @Composable
@@ -471,10 +662,19 @@ private fun shareCurrent(context: Context, state: TrackingState, format: ReportF
 }
 
 @Composable
-private fun Stat(label: String, value: String, modifier: Modifier = Modifier) {
-    Column(modifier) {
-        Text(label, style = MaterialTheme.typography.labelSmall, maxLines = 1)
-        Text(value, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.bodySmall, maxLines = 1)
+private fun Stat(label: String, value: String, modifier: Modifier = Modifier, hud: Boolean = false) {
+    if (hud) {
+        HudSurface(modifier) {
+            Column(Modifier.padding(horizontal = 8.dp, vertical = 6.dp)) {
+                Text(label, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline, maxLines = 1)
+                Text(value, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.bodySmall, maxLines = 1)
+            }
+        }
+    } else {
+        Column(modifier) {
+            Text(label, style = MaterialTheme.typography.labelSmall, maxLines = 1)
+            Text(value, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.bodySmall, maxLines = 1)
+        }
     }
 }
 
@@ -493,6 +693,16 @@ private fun chainageMarkers(points: List<TrackPoint>, interval: Int = 100, confi
     }
     return result
 }
+
+/** cache bitmap ป้าย chainage — กันการสร้าง Bitmap ซ้ำทุก recomposition */
+private val chainageIconCache = object : LinkedHashMap<String, com.google.android.gms.maps.model.BitmapDescriptor>(128, 0.75f, true) {
+    override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, com.google.android.gms.maps.model.BitmapDescriptor>) = size > 256
+}
+
+private fun chainageIconCached(label: String, above: Boolean): com.google.android.gms.maps.model.BitmapDescriptor =
+    synchronized(chainageIconCache) {
+        chainageIconCache.getOrPut("$label|${if (above) "a" else "b"}") { chainageIcon(label, above) }
+    }
 
 private fun chainageIcon(label: String, above: Boolean): com.google.android.gms.maps.model.BitmapDescriptor {
     val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
@@ -686,8 +896,8 @@ private fun ExportDialog(
 ) {
     val context = LocalContext.current
     val maxRoute = points.maxOfOrNull { it.chainageMeters.toInt() } ?: 0
-    var startText by remember { mutableStateOf(chainageInput(config.displayMeters(0))) }
-    var endText by remember { mutableStateOf(chainageInput(config.displayMeters(maxRoute))) }
+    var startText by remember { mutableStateOf(chainageInput(config.displayMeters(0.0))) }
+    var endText by remember { mutableStateOf(chainageInput(config.displayMeters(maxRoute.toDouble()))) }
     var interval by remember { mutableIntStateOf(1_000) }
     var format by remember { mutableStateOf(ReportFormat.PNG) }
     val startDisplay = parseChainageInput(startText).coerceAtLeast(0)
@@ -706,7 +916,10 @@ private fun ExportDialog(
                     OutlinedTextField(startText, { startText = it.filter { c -> c.isDigit() || c == '+' }.take(12) }, Modifier.weight(1f), label = { Text("เริ่ม เช่น 9+500") }, singleLine = true)
                     OutlinedTextField(endText, { endText = it.filter { c -> c.isDigit() || c == '+' }.take(12) }, Modifier.weight(1f), label = { Text("ถึง เช่น 12+000") }, singleLine = true)
                 }
-                Text("ช่วงที่จะ Export: ${chainageLabel(config.displayMeters(routeStart), config.direction)} – ${chainageLabel(config.displayMeters(routeEnd), config.direction)}", style = MaterialTheme.typography.labelMedium)
+                Text(
+                    "ช่วงที่จะ Export: ${chainageLabel(config.displayMeters(routeStart.toDouble()), config.direction)} – ${chainageLabel(config.displayMeters(routeEnd.toDouble()), config.direction)}",
+                    style = MaterialTheme.typography.labelMedium
+                )
                 Text("ระยะป้าย/รายละเอียด", fontWeight = FontWeight.SemiBold)
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     FilterChip(interval == 1_000, { interval = 1_000 }, label = { Text("ภาพรวม · ทุก 1 กม.") })
@@ -729,6 +942,7 @@ private fun ExportDialog(
 }
 
 private fun chainageInput(meters: Int): String = "${meters / 1000}+${(meters % 1000).toString().padStart(3, '0')}"
+
 private fun parseChainageInput(value: String): Int {
     val v = value.trim().replace("กม.", "")
     val parts = v.split('+')
@@ -781,13 +995,21 @@ private fun HistoryMap(
     onAddJunction: (JunctionPoint) -> Unit = {},
     onDeleteJunction: (Long) -> Unit = {}
 ) {
-    val coordinates = points.map { LatLng(it.latitude, it.longitude) }
+    val coordinates = remember(points) { decimatePoints(points).map { LatLng(it.latitude, it.longitude) } }
     val camera = rememberCameraPositionState()
     var mapLoaded by remember { mutableStateOf(false) }
     var detailMode by remember { mutableStateOf(false) }
     var previewMeters by remember(points) { mutableFloatStateOf(points.maxOfOrNull { it.chainageMeters.toFloat() } ?: 0f) }
     var pendingAdd by remember { mutableStateOf<LatLng?>(null) }
     var pendingDeleteJunction by remember { mutableStateOf<JunctionPoint?>(null) }
+    val maxChainage = remember(points) { points.maxOfOrNull { it.chainageMeters.toFloat() } ?: 0f }
+
+    val interval = if (detailMode) 100 else 1_000
+    val selectedKm = if (detailMode) previewMeters.toInt() / 1_000 else null
+    val markers = remember(points, interval, config, selectedKm) {
+        chainageMarkers(points, interval, config, selectedKm)
+    }
+
     LaunchedEffect(mapLoaded, coordinates) {
         if (!mapLoaded || coordinates.isEmpty()) return@LaunchedEffect
         if (coordinates.size == 1) camera.animate(CameraUpdateFactory.newLatLngZoom(coordinates.first(), 18f))
@@ -799,12 +1021,22 @@ private fun HistoryMap(
             onMapLongClick = { pendingAdd = it }
         ) {
             if (coordinates.size > 1) Polyline(points = coordinates, color = Color(0xFF2783DE), width = 14f, zIndex = 10f)
-            val markers = chainageMarkers(points, if (detailMode) 100 else 1_000, config, if (detailMode) previewMeters.toInt() / 1_000 else null)
             markers.forEach { marker ->
-                Marker(state = MarkerState(LatLng(marker.point.latitude, marker.point.longitude)), title = chainageLabel(marker.displayMeters, config.direction), icon = chainageIcon(chainageLabel(marker.displayMeters, config.direction), false), anchor = androidx.compose.ui.geometry.Offset(0.5f, 0.5f))
+                val labelText = chainageLabel(marker.displayMeters, config.direction)
+                Marker(
+                    state = remember(marker.point) { MarkerState(LatLng(marker.point.latitude, marker.point.longitude)) },
+                    title = labelText,
+                    icon = remember(labelText) { chainageIconCached(labelText, false) },
+                    anchor = androidx.compose.ui.geometry.Offset(0.5f, 0.5f)
+                )
             }
             junctions.forEach { junction ->
-                Marker(state = MarkerState(LatLng(junction.latitude, junction.longitude)), title = junctionLabel(junction), snippet = "แตะเพื่อลบ", icon = BitmapDescriptorFactory.defaultMarker(BitmapDescriptorFactory.HUE_ORANGE), onClick = { pendingDeleteJunction = junction; true })
+                Marker(
+                    state = remember(junction.id) { MarkerState(LatLng(junction.latitude, junction.longitude)) },
+                    title = junctionLabel(junction), snippet = "แตะเพื่อลบ",
+                    icon = BitmapDescriptorFactory.defaultMarker(BitmapDescriptorFactory.HUE_ORANGE),
+                    onClick = { pendingDeleteJunction = junction; true }
+                )
             }
         }
         Surface(Modifier.align(Alignment.BottomStart).padding(10.dp), shape = MaterialTheme.shapes.medium, tonalElevation = 3.dp) {
@@ -816,7 +1048,7 @@ private fun HistoryMap(
                 }
                 if (detailMode && points.isNotEmpty()) {
                     Text("เลือกช่วง กม. ${(previewMeters / 1000).toInt()}", style = MaterialTheme.typography.labelSmall)
-                    Slider(previewMeters, { previewMeters = it }, valueRange = 0f..(points.maxOf { it.chainageMeters.toFloat() }.coerceAtLeast(1f)))
+                    Slider(previewMeters, { previewMeters = it }, valueRange = 0f..maxChainage.coerceAtLeast(1f))
                 }
                 Text("แตะค้างเพื่อเพิ่มทางแยก • แตะจุดทางแยกเพื่อลบ", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline)
             }
@@ -832,4 +1064,3 @@ private fun HistoryMap(
         DeleteJunctionDialog(junction, { pendingDeleteJunction = null }, { onDeleteJunction(junction.id); pendingDeleteJunction = null })
     }
 }
-
