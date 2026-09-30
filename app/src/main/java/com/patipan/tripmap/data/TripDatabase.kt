@@ -39,9 +39,9 @@ data class TrackPointEntity(
     val chainageMeters: Double
 )
 
-/** จุดทางแยก (3 แยก/4 แยก) ที่ผูกกับทริป — มาจากการแตะระบุเอง หรือดึงจาก OSM
+/** จุดทางแยก (3 แยก/4 แยก/ทางตัวที/กลับซ้าย) ที่ผูกกับทริป — มาจากการแตะระบุเอง หรือดึงจาก OSM
  *
- *  ค่าถนน (lanes/width/shoulder/surface) เป็นค่า "วัดเฉพาะจุด" — ถ้าเป็น null จะไปใช้ค่าของ
+ *  ค่าถนน (lanes/widthMeters/shoulderMeters/surface) เป็นค่า "วัดเฉพาะจุด" — ถ้าเป็น null จะไปใช้ค่าของ
  *  ช่วงถนน (RoadSegmentEntity) ที่ครอบคลุมจุดนั้นแทน ถ้าไม่มีช่วงครอบก็ค่าว่าง
  */
 @Entity(
@@ -76,6 +76,9 @@ data class JunctionEntity(
  *
  *  อ้างอิงด้วยระยะตามเส้นทาง (chainageMeters) ไม่ใช่พิกัด lat/lon เพราะช่วงต้องอยู่บนเส้นทาง
  *  และทริปถัดไปอาจเริ่ม กม. ไม่เหมือนเดิม — อ้างด้วยระยะจึงตัดช่วงตอน export ได้ตรงเสมอ
+ *
+ *  laneWidthMeters = ความกว้างต่อหนึ่งช่องทาง (เช่น 3.5) — เว้นว่างไว้ถ้าไม่รู้
+ *  widthMeters     = ความกว้างรวมที่วัดจริง — ถ้ากรอก จะได้ค่านี้แทนการคำนวณจากเลน
  */
 @Entity(
     tableName = "road_segments",
@@ -93,6 +96,7 @@ data class RoadSegmentEntity(
     val startChainageMeters: Int,
     val endChainageMeters: Int,
     val lanes: Int = 2,
+    val laneWidthMeters: Double? = null,
     val widthMeters: Double? = null,
     val shoulderMeters: Double? = null,
     val surface: String = SurfaceKind.UNKNOWN,
@@ -171,13 +175,14 @@ interface TripDao {
 
     @Query("""
         UPDATE road_segments SET name = :name, startChainageMeters = :start, endChainageMeters = :end,
-            lanes = :lanes, widthMeters = :width, shoulderMeters = :shoulder,
-            surface = :surface, note = :note, updatedAt = :updatedAt
+            lanes = :lanes, laneWidthMeters = :laneWidth, widthMeters = :width,
+            shoulderMeters = :shoulder, surface = :surface, note = :note, updatedAt = :updatedAt
         WHERE id = :id
     """)
     suspend fun updateSegment(
         id: Long, name: String, start: Int, end: Int, lanes: Int,
-        width: Double?, shoulder: Double?, surface: String, note: String, updatedAt: Long
+        laneWidth: Double?, width: Double?, shoulder: Double?,
+        surface: String, note: String, updatedAt: Long
     )
 
     @Query("DELETE FROM road_segments WHERE id = :id") suspend fun deleteSegment(id: Long)
@@ -185,7 +190,7 @@ interface TripDao {
 
 @Database(
     entities = [TripEntity::class, TrackPointEntity::class, JunctionEntity::class, RoadSegmentEntity::class],
-    version = 5,
+    version = 6,
     exportSchema = false
 )
 abstract class TripDatabase : RoomDatabase() {
@@ -222,8 +227,6 @@ abstract class TripDatabase : RoomDatabase() {
                 db.execSQL("CREATE INDEX IF NOT EXISTS index_junctions_tripId ON junctions(tripId)")
             }
         }
-
-        /** v1.5 — เพิ่มคอลัมน์คุณสมบัติถนนให้จุดทางแยก และตารางช่วงของถนน */
         private val MIGRATION_4_5 = object : Migration(4, 5) {
             override fun migrate(db: SupportSQLiteDatabase) {
                 // nullable → ไม่ต้องใส่ DEFAULT
@@ -257,8 +260,17 @@ abstract class TripDatabase : RoomDatabase() {
             }
         }
 
+        /** v1.5.1 — เพิ่มความกว้างต่อเลน (1 มิลลิเมตร จึงไม่ต้องใส่ DEFAULT) */
+        private val MIGRATION_5_6 = object : Migration(5, 6) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE road_segments ADD COLUMN laneWidthMeters REAL")
+            }
+        }
+
         fun create(context: Context): TripDatabase = Room.databaseBuilder(
             context.applicationContext, TripDatabase::class.java, "trip-map.db"
-        ).addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5).build()
+        ).addMigrations(
+            MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6
+        ).build()
     }
 }

@@ -1,6 +1,7 @@
 package com.patipan.tripmap.ui
 
 import android.content.Context
+import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -134,6 +135,11 @@ private fun TripScreen(
     val active = activeConfig(state, configuredStart)
     val maxRoute = state.points.maxOfOrNull { it.chainageMeters } ?: 0.0
     val draft = segmentDraft
+    val draftVisible = draft != null && layerState.drawMode && layerState.showSegments
+
+    // เก็บค่าล่าสุดไว้ให้แอนิเมชันซ่อน — ถ้าดึง draft ตรง ๆ จะเป็น null แล้ว !! แตก
+    var shownDraft by remember { mutableStateOf<SegmentDraft?>(null) }
+    LaunchedEffect(draft) { if (draft != null) shownDraft = draft }
 
     Box(modifier.fillMaxSize()) {
 
@@ -148,9 +154,11 @@ private fun TripScreen(
             bottomInset = when {
                 layersOpen -> 430.dp
                 panelOpen -> 336.dp
+                draftVisible -> 184.dp
                 else -> 112.dp
             },
             layerState = layerState,
+            draft = draft,
             onMapTap = { latLng ->
                 if (state.points.size > 1) {
                     val c = nearestChainageMeters(state.points, latLng.latitude, latLng.longitude)
@@ -163,16 +171,6 @@ private fun TripScreen(
             onSegmentTap = { seg -> editSegment = seg },
             onUndo = { segmentDraft = segmentDraft?.undo() }
         )
-
-        // ── preview ของช่วงที่กำลังลาก ──
-        if (draft != null && layerState.drawMode && layerState.showSegments) {
-            DraftPreviewOverlay(
-                points = state.points,
-                draft = draft,
-                config = active,
-                onCancel = { segmentDraft = null }
-            )
-        }
 
         // ── HUD ──
         Column(
@@ -189,7 +187,7 @@ private fun TripScreen(
                 HudIconButton(
                     if (layerState.drawMode) Icons.Default.Edit else Icons.Default.Map,
                     "สลับโหมดวาด/ดู"
-                ) { layerState = layerState.copy(drawMode = !layerState.drawMode); segmentDraft = null }
+                ) { layerState = layerState.copy(drawMode = !layerState.drawMode); segmentDraft = null; shownDraft = null }
                 HudIconButton(Icons.Default.Layers, "ชั้นข้อมูล") { layersOpen = true; panelOpen = false }
                 HudIconButton(Icons.Default.Settings, "ตั้งค่าจุดเริ่มและเสียง") { settingsOpen = true }
                 HudIconButton(Icons.Default.Info, "ตรวจสอบ Maps API") { diagnosticsOpen = true }
@@ -204,6 +202,19 @@ private fun TripScreen(
 
         // ── แผงล่าง ──
         Column(Modifier.align(Alignment.BottomCenter).fillMaxWidth()) {
+            // ใช้ shownDraft แทน draft — ตอนกดยกเลิก draft จะ null ทันที
+            AnimatedVisibility(visible = shownDraft != null && layerState.drawMode && layerState.showSegments) {
+                shownDraft?.let { sd ->
+                    DraftInfoBar(
+                        draft = sd,
+                        config = active,
+                        onCancel = {
+                            segmentDraft = null
+                            shownDraft = null
+                        }
+                    )
+                }
+            }
             AnimatedVisibility(visible = layersOpen) {
                 LayersPanel(
                     layerState = layerState,
@@ -251,18 +262,23 @@ private fun TripScreen(
         )
     }
 
-    if (draft != null && draft.end != null && layerState.drawMode) {
-        DraftActionsBar(
-            draft = draft,
-            config = active,
-            onCancel = { segmentDraft = null },
-            onContinue = {
-                editSegment = RoadSegment(
-                    startChainageMeters = minOf(draft.start, draft.end!!).toInt(),
-                    endChainageMeters = maxOf(draft.start, draft.end!!).toInt()
+    if (layerState.drawMode) {
+        draft?.let { d ->
+            if (d.end != null) {
+                DraftActionsBar(
+                    draft = d,
+                    config = active,
+                    onCancel = { segmentDraft = null; shownDraft = null },
+                    onContinue = {
+                        val e = d.end!!
+                        editSegment = RoadSegment(
+                            startChainageMeters = minOf(d.start, e).toInt(),
+                            endChainageMeters = maxOf(d.start, e).toInt()
+                        )
+                    }
                 )
             }
-        )
+        }
     }
 
     if (settingsOpen) ChainageSettingsDialog(configuredStart, configuredVoice, { settingsOpen = false }) { start, voice ->
@@ -343,7 +359,7 @@ private fun LayerRow(title: String, sub: String, on: Boolean, onChange: (Boolean
 }
 
 // ════════════════════════════════════════════════════════════
-//  การลากกำหนดช่วง
+//  การลากกำหนดช่วง (ใช้ร่วมกันทั้งหน้าเดินทางและหน้าประวัติ)
 // ════════════════════════════════════════════════════════════
 
 data class SegmentDraft(val start: Double, val end: Double? = null) {
@@ -353,52 +369,43 @@ data class SegmentDraft(val start: Double, val end: Double? = null) {
     fun undo() = if (end != null) SegmentDraft(start) else null
 }
 
+/** แถบข้อความบอกสถานะตอนกำลังกำหนดช่วง — เส้น/จุดถูกวาดในแผนที่แล้ว */
 @Composable
-private fun DraftPreviewOverlay(
-    points: List<TrackPoint>,
+private fun DraftInfoBar(
     draft: SegmentDraft,
     config: StartChainageConfig,
-    onCancel: () -> Unit
+    onCancel: () -> Unit,
+    compact: Boolean = false
 ) {
+    val hasEnd = draft.end != null
     val lo = minOf(draft.start, draft.end ?: draft.start)
     val hi = maxOf(draft.start, draft.end ?: draft.start)
-    val slice = remember(points, lo, hi) { sliceByChainage(points, lo, hi) }
-    val coords = remember(slice) { decimatePoints(slice).map { LatLng(it.latitude, it.longitude) } }
-    val hasEnd = draft.end != null
-
-    Box(Modifier.fillMaxSize()) {
-        if (coords.size > 1) {
-            Polyline(points = coords, color = Color(0xFFF2A03D), width = 18f, zIndex = 30f, geodesic = true)
-        }
-        if (hasEnd) {
-            listOf(draft.start, draft.end!!).forEach { c ->
-                pointAtChainage(points, c)?.let { p ->
-                    Marker(
-                        state = remember(p) { MarkerState(LatLng(p.latitude, p.longitude)) },
-                        title = chainageLabel(config.displayMeters(c), config.direction),
-                        icon = BitmapDescriptorFactory.defaultMarker(BitmapDescriptorFactory.HUE_ORANGE),
-                        zIndex = 31f
-                    )
-                }
-            }
-        }
-        Surface(
-            Modifier.align(Alignment.TopCenter).padding(top = 108.dp),
-            shape = RoundedCornerShape(10.dp),
-            color = Color(0xFFF2A03D),
-            shadowElevation = 3.dp
+    Surface(
+        if (compact) Modifier.fillMaxWidth() else Modifier.fillMaxWidth().padding(horizontal = 10.dp),
+        shape = RoundedCornerShape(12.dp),
+        color = Color(0xFFE8963D),
+        shadowElevation = 4.dp
+    ) {
+        Row(
+            Modifier.padding(start = 12.dp, end = 4.dp, top = 6.dp, bottom = 6.dp),
+            verticalAlignment = Alignment.CenterVertically
         ) {
-            Text(
-                if (!hasEnd) "กำหนดจุดเริ่ม: ${chainageLabel(config.displayMeters(draft.start), config.direction)} — แตะจุดถัดไป"
-                else "${chainageLabel(config.displayMeters(lo), config.direction)} – ${chainageLabel(config.displayMeters(hi), config.direction)}",
-                Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
-                style = MaterialTheme.typography.labelMedium,
-                color = Color.White,
-                fontWeight = FontWeight.SemiBold
-            )
-        }
-        IconButton(onCancel, Modifier.align(Alignment.TopEnd).padding(top = 108.dp)) {
-            Icon(Icons.Default.Close, "ยกเลิกการกำหนดช่วง")
+            Column(Modifier.weight(1f)) {
+                Text(
+                    if (!hasEnd) "กำหนดจุดเริ่ม: ${chainageLabel(config.displayMeters(draft.start), config.direction)}"
+                    else "${chainageLabel(config.displayMeters(lo), config.direction)} – ${chainageLabel(config.displayMeters(hi), config.direction)}",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = Color.White,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Text(
+                    if (!hasEnd) "แตะแผนที่อีกจุดเพื่อกำหนดจุดจบของช่วง"
+                    else "กด “กำหนดค่าถนน” ด้านล่างเพื่อกรอกคุณสมบัติถนน",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = Color.White.copy(alpha = 0.92f)
+                )
+            }
+            TextButton(onCancel) { Text("ยกเลิก", color = Color.White) }
         }
     }
 }
@@ -443,12 +450,13 @@ private fun RoadSegmentDialog(
     var start by remember { mutableIntStateOf(segment.startChainageMeters) }
     var end by remember { mutableIntStateOf(segment.endChainageMeters) }
     var lanes by remember { mutableIntStateOf(segment.lanes) }
+    var laneWidth by remember { mutableStateOf(segment.laneWidthMeters?.let { fmtNum(it) } ?: "3.5") }
     var width by remember { mutableStateOf(segment.widthMeters?.let { fmtNum(it) } ?: "") }
     var shoulder by remember { mutableStateOf(segment.shoulderMeters?.let { fmtNum(it) } ?: "") }
     var surface by remember { mutableStateOf(segment.surface) }
     var note by remember { mutableStateOf(segment.note) }
 
-    val attrs = RoadAttributes(lanes, width.toDoubleOrNull(), shoulder.toDoubleOrNull(), surface, name.ifBlank { null })
+    val attrs = RoadAttributes(lanes, laneWidth.toDoubleOrNull(), width.toDoubleOrNull(), shoulder.toDoubleOrNull(), surface, name.ifBlank { null })
     val lengthM = (end - start).coerceAtLeast(0)
 
     AlertDialog(
@@ -478,20 +486,33 @@ private fun RoadSegmentDialog(
                     )
                 }
                 Text("จำนวนเลน (ต่อทิศทาง)", style = MaterialTheme.typography.labelMedium)
-                Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                    (1..5).forEach { n -> FilterChip(lanes == n, { lanes = n }, label = { Text(if (n == 5) "5+" else "$n") }) }
-                }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedTextField(
-                        width, { width = it.filter { c -> c.isDigit() || c == '.' }.take(5) },
-                        Modifier.weight(1f), label = { Text("กว้าง (ม.)") }, singleLine = true
+                        laneWidth, { laneWidth = it.filter { c -> c.isDigit() || c == '.' }.take(5) },
+                        Modifier.weight(1f), label = { Text("กว้าง/เลน (ม.)") }, singleLine = true
                     )
                     OutlinedTextField(
                         shoulder, { shoulder = it.filter { c -> c.isDigit() || c == '.' }.take(4) },
-                        Modifier.weight(1f), label = { Text("ไหล่ทาง (ม.)") }, singleLine = true
+                        Modifier.weight(1f), label = { Text("ไหล่ทาง/ข้าง (ม.)") }, singleLine = true
                     )
                 }
-                Text("เว้นว่างได้ — ถ้าไม่กรอกจะประมาณจากจำนวนเลน × 3.5 ม.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    OutlinedTextField(
+                        width, { width = it.filter { c -> c.isDigit() || c == '.' }.take(5) },
+                        Modifier.weight(1f), label = { Text("กว้างรวม (ถ้าวัดแล้ว)") }, singleLine = true
+                    )
+                    Text(
+                        attrs.carriagewayWidthMeters?.let { "= ${fmtNum(it)} ม." } ?: "= -",
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.padding(top = 18.dp)
+                    )
+                }
+                Text(
+                    "กรอก “กว้าง/เลน” หรือเว้นว่างไว้ (ใช้ 3.5 ม. ต่อช่องทาง) · ถ้าวัดได้ให้กรอก “กว้างรวม” จะใช้ค่านั้นแทน",
+                    style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline
+                )
                 Text("ผิวถนน", style = MaterialTheme.typography.labelMedium)
                 Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
                     FilterChip(surface == SurfaceKind.UNKNOWN, { surface = SurfaceKind.UNKNOWN }, label = { Text("ยังไม่ระบุ", style = MaterialTheme.typography.labelSmall) })
@@ -518,6 +539,7 @@ private fun RoadSegmentDialog(
                     startChainageMeters = start,
                     endChainageMeters = end,
                     lanes = lanes,
+                    laneWidthMeters = laneWidth.toDoubleOrNull(),
                     widthMeters = width.toDoubleOrNull(),
                     shoulderMeters = shoulder.toDoubleOrNull(),
                     surface = surface,
@@ -592,7 +614,7 @@ private fun JunctionEditDialog(
                     Column(Modifier.weight(1f)) {
                         Text("วัดค่าถนนเฉพาะจุดนี้", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
                         Text(
-                            if (override) "ใช้ค่าที่กรอกเอง" else "ใช้ค่าจา่านช่วงถนน: ${eff.summary()}",
+                            if (override) "ใช้ค่าที่กรอกเอง" else "ใช้ค่าจากช่วงถนน: ${eff.summary()}",
                             style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline
                         )
                     }
@@ -845,7 +867,7 @@ private fun ShareButton(onClick: () -> Unit, icon: ImageVector, label: String, m
 }
 
 // ════════════════════════════════════════════════════════════
-//  แผนที่
+//  แผนที่ (หน้าเดินทาง)
 // ════════════════════════════════════════════════════════════
 
 @Composable
@@ -858,6 +880,7 @@ private fun RealtimeMap(
     drawMode: Boolean = false,
     bottomInset: Dp = 12.dp,
     layerState: MapLayerState = MapLayerState(),
+    draft: SegmentDraft? = null,
     onMapTap: (LatLng) -> Unit = {},
     onJunctionTap: (JunctionPoint) -> Unit = {},
     onAddJunction: (JunctionPoint) -> Unit = {},
@@ -890,6 +913,14 @@ private fun RealtimeMap(
             val coords = decimatePoints(slice).map { p -> LatLng(p.latitude, p.longitude) }
             seg to coords
         }
+    }
+
+    // เส้นของช่วงที่กำลังลาก — คำนวณนอก GoogleMap แต่วาดข้างใน
+    val draftLo = draft?.let { minOf(it.start, it.end ?: it.start) } ?: 0.0
+    val draftHi = draft?.let { maxOf(it.start, it.end ?: it.start) } ?: 0.0
+    val draftCoords = remember(points, draftLo, draftHi) {
+        if (draft == null) emptyList()
+        else decimatePoints(sliceByChainage(points, draftLo, draftHi)).map { LatLng(it.latitude, it.longitude) }
     }
 
     LaunchedEffect(mapLoaded, points.size, follow) {
@@ -925,6 +956,29 @@ private fun RealtimeMap(
                     )
                 }
             }
+
+            if (draft != null && draftCoords.size > 1) {
+                Polyline(
+                    points = draftCoords,
+                    color = Color(0xFFF2A03D),
+                    width = 18f,
+                    zIndex = 30f,
+                    geodesic = true
+                )
+            }
+            if (draft != null && draft.end != null) {
+                listOf(draft.start, draft.end!!).forEach { c ->
+                    pointAtChainage(points, c)?.let { p ->
+                        Marker(
+                            state = remember(p) { MarkerState(LatLng(p.latitude, p.longitude)) },
+                            title = chainageLabel(config.displayMeters(c), config.direction),
+                            icon = BitmapDescriptorFactory.defaultMarker(BitmapDescriptorFactory.HUE_ORANGE),
+                            zIndex = 31f
+                        )
+                    }
+                }
+            }
+
             markers.forEachIndexed { index, marker ->
                 val labelText = chainageLabel(marker.displayMeters, config.direction)
                 val above = index % 2 == 0
@@ -1059,8 +1113,11 @@ private fun junctionLabel(junction: JunctionPoint): String {
     return "${junction.type.label()} ($sideLabel)"
 }
 
-/** ✅ แก้จุดที่ 4 — ส่งช่วงถนนไปกับรายงาน */
 private fun shareCurrent(context: Context, state: TrackingState, format: ReportFormat) {
+    if (format == ReportFormat.DXF && state.points.size < 2) {
+        Toast.makeText(context, "ต้องเดินอย่างน้อย 2 จุดก่อน จึงจะ Export DXF ได้", Toast.LENGTH_LONG).show()
+        return
+    }
     val start = state.startedAt ?: System.currentTimeMillis()
     TripReportExporter.share(context, TripReport(
         start, System.currentTimeMillis() - start,
@@ -1264,6 +1321,7 @@ private fun HistoryDetailScreen(
     val points = remember(data.points) { data.points.sortedBy { it.sequence }.map { TrackPoint(it.latitude, it.longitude, it.accuracyMeters, it.timestamp, it.chainageMeters) } }
     val junctions = remember(data.junctions) { data.junctions.map { it.toDomain() } }
     val segments = remember(data.roadSegments) { data.roadSegments.map { it.toDomain() }.sortedByRange() }
+    val maxRoute = points.maxOfOrNull { it.chainageMeters } ?: 0.0
 
     var renameOpen by remember(trip.id) { mutableStateOf(false) }
     var deleteOpen by remember(trip.id) { mutableStateOf(false) }
@@ -1273,6 +1331,13 @@ private fun HistoryDetailScreen(
     var editJunction by remember { mutableStateOf<JunctionPoint?>(null) }
     var editSegment by remember { mutableStateOf<RoadSegment?>(null) }
     var showSegments by remember { mutableStateOf(true) }
+
+    // ✅ โหมดวาดในหน้าประวัติ — แก้ช่วงที่บันทึกไว้แล้วได้
+    var drawMode by remember(trip.id) { mutableStateOf(false) }
+    var draft by remember { mutableStateOf<SegmentDraft?>(null) }
+    var shownDraft by remember { mutableStateOf<SegmentDraft?>(null) }
+    LaunchedEffect(draft) { if (draft != null) shownDraft = draft }
+
     val scope = rememberCoroutineScope()
 
     Scaffold(topBar = {
@@ -1280,6 +1345,12 @@ private fun HistoryDetailScreen(
             title = { Text(tripDisplayName(trip), maxLines = 1) },
             navigationIcon = { IconButton(onBack) { Icon(Icons.Default.ArrowBack, "ย้อนกลับ") } },
             actions = {
+                IconButton({ drawMode = !drawMode; draft = null; shownDraft = null }) {
+                    Icon(
+                        if (drawMode) Icons.Default.Edit else Icons.Default.Draw,
+                        if (drawMode) "ออกจากโหมดวาด" else "โหมดวาดช่วงถนน"
+                    )
+                }
                 IconButton({ onSaveTripFile(trip.id, "${tripDisplayName(trip).replace(Regex("[^A-Za-z0-9._-]+"), "_").take(40)}.tripmap") }) { Icon(Icons.Default.Save, "บันทึกไฟล์ทริป") }
                 IconButton({ renameOpen = true }) { Icon(Icons.Default.Edit, "แก้ไขชื่อ") }
                 IconButton({ deleteOpen = true }) { Icon(Icons.Default.Delete, "ลบทริป", tint = MaterialTheme.colorScheme.error) }
@@ -1290,10 +1361,52 @@ private fun HistoryDetailScreen(
             HistoryMap(
                 points, junctions, Modifier.weight(1f), tripConfig,
                 roadSegments = segments, showSegments = showSegments,
+                drawMode = drawMode,
+                draft = draft,
+                onMapTap = { latLng ->
+                    if (points.size > 1) {
+                        val c = nearestChainageMeters(points, latLng.latitude, latLng.longitude)
+                        draft = draft?.next(c, maxRoute) ?: SegmentDraft(c)
+                    }
+                },
                 onAddJunction = { onAddJunction(trip.id, it) },
                 onDeleteJunction = { onDeleteJunction(trip.id, it) },
-                onJunctionTap = { editJunction = it }
+                onJunctionTap = { editJunction = it },
+                onSegmentTap = { seg -> editSegment = seg },
+                onUndo = { draft = draft?.undo() }
             )
+
+            // แถบบอกสถานะตอนกำลังกำหนดช่วง
+            AnimatedVisibility(visible = shownDraft != null && drawMode) {
+                shownDraft?.let { sd ->
+                    DraftInfoBar(
+                        draft = sd,
+                        config = tripConfig,
+                        onCancel = { draft = null; shownDraft = null },
+                        compact = true
+                    )
+                }
+            }
+            if (drawMode) {
+                draft?.let { d ->
+                    if (d.end != null) {
+                        DraftActionsBar(
+                            draft = d,
+                            config = tripConfig,
+                            onCancel = { draft = null; shownDraft = null },
+                            onContinue = {
+                                val e = d.end!!
+                                editSegment = RoadSegment(
+                                    startChainageMeters = minOf(d.start, e).toInt(),
+                                    endChainageMeters = maxOf(d.start, e).toInt()
+                                )
+                                draft = null; shownDraft = null
+                            }
+                        )
+                    }
+                }
+            }
+
             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text(SimpleDateFormat("d MMMM yyyy, HH:mm", Locale("th", "TH")).format(Date(trip.startedAt)), fontWeight = FontWeight.SemiBold)
                 Row(Modifier.fillMaxWidth()) {
@@ -1308,7 +1421,11 @@ private fun HistoryDetailScreen(
                     FilterChip(showSegments, { showSegments = !showSegments }, label = { Text("แสดงบนแผนที่", style = MaterialTheme.typography.labelSmall) })
                 }
                 if (segments.isEmpty()) {
-                    Text("ยังไม่มีข้อมูลช่วงถนน — กดเพิ่มเพื่อบันทึกความกว้าง จำนวนเลน ไหล่ทาง และผิวถนน", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline)
+                    Text(
+                        if (drawMode) "โหมดวาดเปิดอยู่ — แตะแผนที่ 2 ครั้งเพื่อกำหนดช่วงใหม่"
+                        else "ยังไม่มีข้อมูลช่วงถนน — กด ✏️ บนแถบบนเพื่อวาดบนแผนที่ หรือกดเพิ่มเพื่อกรอกค่าเอง",
+                        style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline
+                    )
                 } else {
                     segments.forEach { seg ->
                         Surface(
@@ -1377,8 +1494,6 @@ private fun HistoryDetailScreen(
 
     if (renameOpen) RenameTripDialog(trip, { renameOpen = false }) { onRename(trip.id, it); renameOpen = false }
     if (deleteOpen) DeleteTripDialog(trip, { deleteOpen = false }) { onDelete(trip.id); deleteOpen = false }
-
-    // ✅ แก้จุดที่ 1 — ส่ง segments เข้า ExportDialog
     if (exportOpen) ExportDialog(trip, points, tripConfig, junctions, segments, onDismiss = { exportOpen = false })
 
     editJunction?.let { j ->
@@ -1399,7 +1514,6 @@ private fun HistoryDetailScreen(
     }
 }
 
-/** ✅ แก้จุดที่ 2 + 3 — รับ segments และส่งต่อไปยัง TripReport */
 @Composable
 private fun ExportDialog(
     trip: TripEntity,
@@ -1498,6 +1612,10 @@ private fun tripDisplayName(trip: TripEntity): String = trip.name.ifBlank {
     "ทริป ${SimpleDateFormat("d MMM yyyy HH:mm", Locale("th", "TH")).format(Date(trip.startedAt))}"
 }
 
+// ════════════════════════════════════════════════════════════
+//  แผนที่ (หน้าประวัติ) — รองรับโหมดวาด
+// ════════════════════════════════════════════════════════════
+
 @Composable
 private fun HistoryMap(
     points: List<TrackPoint>,
@@ -1506,9 +1624,14 @@ private fun HistoryMap(
     config: StartChainageConfig = StartChainageConfig(),
     roadSegments: List<RoadSegment> = emptyList(),
     showSegments: Boolean = true,
+    drawMode: Boolean = false,
+    draft: SegmentDraft? = null,
+    onMapTap: (LatLng) -> Unit = {},
     onAddJunction: (JunctionPoint) -> Unit = {},
     onDeleteJunction: (Long) -> Unit = {},
-    onJunctionTap: (JunctionPoint) -> Unit = {}
+    onJunctionTap: (JunctionPoint) -> Unit = {},
+    onSegmentTap: (RoadSegment) -> Unit = {},
+    onUndo: () -> Unit = {}
 ) {
     val coordinates = remember(points) { decimatePoints(points).map { LatLng(it.latitude, it.longitude) } }
     val camera = rememberCameraPositionState()
@@ -1533,16 +1656,57 @@ private fun HistoryMap(
         }
     }
 
+    // เส้นของช่วงที่กำลังลาก
+    val draftLo = draft?.let { minOf(it.start, it.end ?: it.start) } ?: 0.0
+    val draftHi = draft?.let { maxOf(it.start, it.end ?: it.start) } ?: 0.0
+    val draftCoords = remember(points, draftLo, draftHi) {
+        if (draft == null) emptyList()
+        else decimatePoints(sliceByChainage(points, draftLo, draftHi)).map { LatLng(it.latitude, it.longitude) }
+    }
+
     LaunchedEffect(mapLoaded, coordinates) {
         if (!mapLoaded || coordinates.isEmpty()) return@LaunchedEffect
         if (coordinates.size == 1) camera.animate(CameraUpdateFactory.newLatLngZoom(coordinates.first(), 18f))
         else camera.animate(CameraUpdateFactory.newLatLngBounds(LatLngBounds.builder().apply { coordinates.forEach { include(it) } }.build(), 100))
     }
     Box(modifier) {
-        GoogleMap(Modifier.fillMaxSize(), cameraPositionState = camera, onMapLoaded = { mapLoaded = true }, onMapLongClick = { pendingAdd = it }) {
+        GoogleMap(
+            Modifier.fillMaxSize(),
+            cameraPositionState = camera,
+            onMapLoaded = { mapLoaded = true },
+            onMapClick = { latLng -> if (drawMode) onMapTap(latLng) },
+            onMapLongClick = { pendingAdd = it }
+        ) {
             if (coordinates.size > 1) Polyline(points = coordinates, color = Color(0xFF9AA7B5), width = 11f, zIndex = 10f)
             segmentLines.forEach { (seg, coords) ->
                 Polyline(points = coords, color = aciColor(seg.colorIndex), width = 17f, zIndex = 12f)
+                if (drawMode) {
+                    val mid = pointAtChainage(points, (seg.startChainageMeters + seg.endChainageMeters) / 2.0)
+                    mid?.let { p ->
+                        Marker(
+                            state = MarkerState(LatLng(p.latitude, p.longitude)),
+                            title = seg.name.ifBlank { "ช่วงถนน" },
+                            snippet = seg.attributes().summary(),
+                            icon = BitmapDescriptorFactory.defaultMarker(aciHue(seg.colorIndex)),
+                            onClick = { onSegmentTap(seg); true }
+                        )
+                    }
+                }
+            }
+            if (draft != null && draftCoords.size > 1) {
+                Polyline(points = draftCoords, color = Color(0xFFF2A03D), width = 18f, zIndex = 30f, geodesic = true)
+            }
+            if (draft != null && draft.end != null) {
+                listOf(draft.start, draft.end!!).forEach { c ->
+                    pointAtChainage(points, c)?.let { p ->
+                        Marker(
+                            state = MarkerState(LatLng(p.latitude, p.longitude)),
+                            title = chainageLabel(config.displayMeters(c), config.direction),
+                            icon = BitmapDescriptorFactory.defaultMarker(BitmapDescriptorFactory.HUE_ORANGE),
+                            zIndex = 31f
+                        )
+                    }
+                }
             }
             markers.forEach { marker ->
                 val labelText = chainageLabel(marker.displayMeters, config.direction)
@@ -1570,11 +1734,19 @@ private fun HistoryMap(
                     Spacer(Modifier.width(6.dp))
                     FilterChip(detailMode, { detailMode = true }, label = { Text("รายละเอียด · 100 ม.") })
                 }
+                if (drawMode) {
+                    Spacer(Modifier.height(4.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("โหมดวาด · แตะ 2 ครั้ง", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary, modifier = Modifier.weight(1f))
+                        IconButton({ onUndo() }, Modifier.size(28.dp)) { Icon(Icons.Default.Undo, "ย้อนกลับ", Modifier.size(16.dp)) }
+                    }
+                } else {
+                    Text("แตะค้างเพื่อเพิ่มทางแยก • แตะจุดเพื่อแก้ไข", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline)
+                }
                 if (detailMode && points.isNotEmpty()) {
                     Text("เลือกช่วง กม. ${(previewMeters / 1000).toInt()}", style = MaterialTheme.typography.labelSmall)
                     Slider(previewMeters, { previewMeters = it }, valueRange = 0f..maxChainage.coerceAtLeast(1f))
                 }
-                Text("แตะค้างเพื่อเพิ่มทางแยก • แตะจุดเพื่อแก้ไข", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline)
             }
         }
     }

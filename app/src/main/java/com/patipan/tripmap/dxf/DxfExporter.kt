@@ -141,7 +141,7 @@ object DxfExporter {
             val seg = span.segment
             val layer = seg?.let { segmentLayerName(segments.indexOf(it)) } ?: "ROAD_EDGE"
             val attrs = seg?.attributes()
-                ?: RoadAttributes(options.lanes, options.roadWidthMeters, null, SurfaceKind.UNKNOWN, null)
+                ?: RoadAttributes(lanes = options.lanes, widthMeters = options.roadWidthMeters, surface = SurfaceKind.UNKNOWN)
             val halfWidth = ((attrs.totalWidthMeters ?: options.roadWidthMeters) / 2).coerceIn(1.0, 30.0)
             val centerLine = span.points.map { project(it.latitude, it.longitude) }
             if (centerLine.size < 2) return@forEach

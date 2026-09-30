@@ -8,6 +8,8 @@ import org.locationtech.jts.geom.MultiPolygon
 import org.locationtech.jts.geom.Polygon
 import org.locationtech.jts.operation.buffer.BufferOp
 import org.locationtech.jts.operation.buffer.BufferParameters
+import org.locationtech.jts.precision.GeometryPrecisionReducer
+import org.locationtech.jts.geom.PrecisionModel
 import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
@@ -15,6 +17,14 @@ import kotlin.math.min
 /** ตรรกะเรขาคณิตของถนน — พอร์ตมาจากต้นแบบ Python (shapely) ให้ทำงานเหมือนกันทุกประการ */
 object RoadGeometry {
     private val gf = GeometryFactory()
+
+    /**
+     * ความละเอียดพิกัดสำหรับ union — 1 มิลลิเมตร
+     *
+     * ต่ำกว่าความแม่น GPS มือถือ (3–5 ม.) มาก จึงไม่กระทบงานสำรวจ
+     * แต่พอที่จะทำให้พิกัดที่ควรตรงกันหมดกลายเป็นตรงกันจริง
+     */
+    private val PRECISION_MODEL = PrecisionModel(0.001)
 
     data class Pt(val x: Double, val y: Double)
 
@@ -38,7 +48,9 @@ object RoadGeometry {
             val len = hypot(sx, sy)
             vertexNormals[i] = if (len > 1e-9) Pt(sx / len, sy / len) else segNormals[i - 1]
         }
-        return points.indices.map { i -> Pt(points[i].x + vertexNormals[i].x * distance, points[i].y + vertexNormals[i].y * distance) }
+        return points.indices.map { i ->
+            Pt(points[i].x + vertexNormals[i].x * distance, points[i].y + vertexNormals[i].y * distance)
+        }
     }
 
     fun roadPolygon(points: List<Pt>, halfWidth: Double): Polygon {
@@ -48,36 +60,70 @@ object RoadGeometry {
         return gf.createPolygon(ringPts.toTypedArray())
     }
 
+    /**
+     * รวม polygon หลายชิ้นเข้าด้วยกัน
+     *
+     * พิกัดจาก GPS มี noise ทำให้เส้นขอบถนนที่ตัดกันตรงมุมกลายเป็น non-noded intersection
+     * ซึ่ง JTS union() ไม่ยอมรับ — ต้องลดความละเอียดพิกัดให้ตรงกันก่อน (snap ให้ตรงกันภายใน 1 มม.)
+     *
+     * ห่อ runCatching ทุกขั้น เพื่อถ้าชิ้นใดพังก็ข้างไป แทนที่จะทำให้ทั้ง export ล้ม
+     */
     fun unionAll(polys: List<Polygon>): Geometry {
-        var result: Geometry = polys.first()
-        for (p in polys.drop(1)) result = result.union(p)
-        return result
+        if (polys.isEmpty()) return gf.createPolygon()
+
+        val reduced = polys.mapNotNull { p ->
+            runCatching { GeometryPrecisionReducer.reduce(p, PRECISION_MODEL) }.getOrNull()
+        }
+        if (reduced.isEmpty()) return gf.createPolygon()
+        if (reduced.size == 1) return reduced.first()
+
+        var result = reduced.first()
+        for (p in reduced.drop(1)) {
+            result = runCatching { result.union(p) }.getOrElse { result }
+        }
+        // buffer(0) ซ่อม polygon ที่เสียรูปจากการรวม (เช่นรูปตัวหมายที่เกิดจากการอยู่ในกัน)
+        return runCatching { result.buffer(0.0) }.getOrDefault(result)
     }
 
     /** ขยายแล้วหดกลับด้วย round join — มนมุมตรงรอยต่อทางแยกเล็กน้อย เหมือนต้นแบบ Python */
     fun smooth(geom: Geometry, distance: Double): Geometry {
-        val params = BufferParameters().apply { joinStyle = BufferParameters.JOIN_ROUND }
-        val expanded = BufferOp.bufferOp(geom, distance, params)
-        return BufferOp.bufferOp(expanded, -distance, params)
+        if (distance <= 0.0) return geom
+        return runCatching {
+            val params = BufferParameters().apply { joinStyle = BufferParameters.JOIN_ROUND }
+            val expanded = BufferOp.bufferOp(geom, distance, params)
+            BufferOp.bufferOp(expanded, -distance, params)
+        }.getOrDefault(geom)
     }
 
     fun surfacePolygons(geom: Geometry): List<Polygon> = when (geom) {
         is Polygon -> listOf(geom)
-        is MultiPolygon -> (0 until geom.numGeometries).map { geom.getGeometryN(it) as Polygon }
+        is MultiPolygon -> (0 until geom.numGeometries).mapNotNull {
+            runCatching { geom.getGeometryN(it) as Polygon }.getOrNull()
+        }
         else -> emptyList()
     }
 
-    /** ตัดขอบถนนตรงจุดปลายอิสระ (ต้นทาง/ปลายทาง/ปลายทางแยก) ออก ไม่ให้มีเส้นปิดหัว-ท้าย */
+    /**
+     * ตัดขอบถนนตรงจุดปลายอิสระ (ต้นทาง/ปลายทาง/ปลายทางแยก) ออก ไม่ให้มีเส้นปิดหัว-ท้าย
+     */
     fun trimCaps(polygons: List<Polygon>, freeEnds: List<Pt>, radius: Double): List<List<Pt>> {
         if (freeEnds.isEmpty()) return polygons.map { p -> p.exteriorRing.coordinates.map { Pt(it.x, it.y) } }
-        var cutUnion: Geometry = gf.createPoint(Coordinate(freeEnds[0].x, freeEnds[0].y)).buffer(radius)
-        for (pt in freeEnds.drop(1)) {
-            cutUnion = cutUnion.union(gf.createPoint(Coordinate(pt.x, pt.y)).buffer(radius))
-        }
+        if (radius <= 0.0) return polygons.map { p -> p.exteriorRing.coordinates.map { Pt(it.x, it.y) } }
+
+        val cut = runCatching {
+            var cutUnion: Geometry = gf.createPoint(Coordinate(freeEnds[0].x, freeEnds[0].y)).buffer(radius)
+            for (pt in freeEnds.drop(1)) {
+                cutUnion = runCatching {
+                    cutUnion.union(gf.createPoint(Coordinate(pt.x, pt.y)).buffer(radius))
+                }.getOrDefault(cutUnion)
+            }
+            cutUnion
+        }.getOrNull() ?: return polygons.map { p -> p.exteriorRing.coordinates.map { Pt(it.x, it.y) } }
+
         val chains = mutableListOf<List<Pt>>()
         for (poly in polygons) {
             val boundary: LineString = poly.exteriorRing
-            val remainder = boundary.difference(cutUnion)
+            val remainder = runCatching { boundary.difference(cut) }.getOrNull() ?: continue
             for (i in 0 until remainder.numGeometries) {
                 val g = remainder.getGeometryN(i)
                 if (g is LineString && g.length > 0.5) {
@@ -98,5 +144,34 @@ object RoadGeometry {
         val dx = b.x - a.x; val dy = b.y - a.y
         val len = hypot(dx, dy).let { if (it < 1e-9) 1.0 else it }
         return route[idx] to Pt(dx / len, dy / len)
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  v1.5 — ตัวช่วยสำหรับช่องทาง/ไหล่ทาง
+    // ════════════════════════════════════════════════════════════
+
+    /**
+     * เส้นแบ่งช่องทางเดินรถ — อยู่กลางถนนเสมอ ถ้าเลขคี่เท่าไหร่ก็มีเส้นนั้น−1 เส้น
+     *
+     * @param laneCount จำนวนช่องทางต่อทิศทาง
+     * @param carriagewayWidth ความกว้างช่องทางเดินรถรวม (ไม่รวมไหล่ทาง)
+     */
+    fun laneDividerOffsets(laneCount: Int, carriagewayWidth: Double): List<Double> {
+        val n = laneCount.coerceAtLeast(2)
+        val laneW = carriagewayWidth / n
+        // เส้นแบ่งอยู่ที่ระยะเท่ากับขอบถนน + k × ความกว้างช่องทาง
+        return (1 until n).map { k -> -carriagewayWidth / 2 + k * laneW }
+    }
+
+    /**
+     * เส้นขอบไหล่ทาง — เส้นคั่นระหว่างช่องทางเดินรถกับไหล่ทาง
+     *
+     * @param carriagewayWidth ความกว้างช่องทางเดินรถรวม
+     * @param shoulderWidth ระยะไหล่ทางต่อข้าง
+     */
+    fun shoulderEdgeOffsets(carriagewayWidth: Double, shoulderWidth: Double): List<Double> {
+        if (shoulderWidth <= 0.0) return emptyList()
+        val half = carriagewayWidth / 2
+        return listOf(-(half + shoulderWidth), half + shoulderWidth)
     }
 }

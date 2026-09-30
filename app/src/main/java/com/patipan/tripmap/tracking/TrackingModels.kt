@@ -15,7 +15,7 @@ enum class ChainageDirection { LT, RT }
 
 enum class VoiceMode { THAI, ENGLISH, OFF }
 
-/** 3 แยก, 4 แยก, T หรือกลับซ้าย — ขยายจากเดิมเพื่อรองรับงานสำรวจ */
+/** รูปแบบทางแยก — รวม T และกลับซ้ายที่งานสำรวจถนนต้องใช้บ่อย */
 enum class JunctionType { THREE_WAY, FOUR_WAY, T, LEFT_TURN }
 
 /** ด้านของแขนแยกเทียบทิศทางเดินทาง ณ จุดนั้น — BOTH ใช้กับ 4-way เสมอ */
@@ -27,7 +27,7 @@ enum class JunctionSource { OSM, MANUAL }
 fun JunctionType.label() = when (this) {
     JunctionType.THREE_WAY -> "3 แยก"
     JunctionType.FOUR_WAY -> "4 แยก"
-    JunctionType.T -> "ทางแยกรูปตัวที"
+    JunctionType.T -> "ทางตัวที"
     JunctionType.LEFT_TURN -> "กลับซ้าย"
 }
 
@@ -61,6 +61,7 @@ data class RoadSegment(
     val startChainageMeters: Int,
     val endChainageMeters: Int,
     val lanes: Int = 2,
+    val laneWidthMeters: Double? = null,
     val widthMeters: Double? = null,
     val shoulderMeters: Double? = null,
     val surface: String = SurfaceKind.UNKNOWN,
@@ -70,13 +71,13 @@ data class RoadSegment(
     val updatedAt: Long = System.currentTimeMillis()
 ) {
     val lengthMeters: Int get() = (endChainageMeters - startChainageMeters).coerceAtLeast(0)
-    val widthTotalMeters: Double? get() = attributes().totalWidthMeters
 
     fun contains(routeMeters: Double) =
         routeMeters >= startChainageMeters && routeMeters <= endChainageMeters
 
     fun attributes() = RoadAttributes(
         lanes = lanes,
+        laneWidthMeters = laneWidthMeters,
         widthMeters = widthMeters,
         shoulderMeters = shoulderMeters,
         surface = surface,
@@ -84,43 +85,69 @@ data class RoadSegment(
     )
 }
 
-/** ค่าถนนที่รวมแล้ว — ใช้ทั้งกับช่วงถนนและจุดทางแยก */
+/** ค่าถนนที่รวมแล้ว — ใช้ทั้งกับช่วงถนนและจุดทางแยก
+ *
+ *  ลำดับพารามิเตอร์: lanes → laneWidthMeters → widthMeters → shoulderMeters → surface → segmentName
+ */
 data class RoadAttributes(
     val lanes: Int? = null,
+    val laneWidthMeters: Double? = null,
     val widthMeters: Double? = null,
     val shoulderMeters: Double? = null,
     val surface: String = SurfaceKind.UNKNOWN,
     val segmentName: String? = null
 ) {
-    val isEmpty: Boolean
-        get() = lanes == null && widthMeters == null && shoulderMeters == null &&
-                surface == SurfaceKind.UNKNOWN
+    companion object {
+        /** มาตรฐานถนนชั้นที่ 2 ไทย — ใช้เมื่อไม่ได้ระบุความกว้างต่อเลน */
+        const val DEFAULT_LANE_WIDTH = 3.5
+    }
 
-    /** ความกว้างรวมช่องทางเดินรถ + ไหล่ทางสองข้าง
+    val isEmpty: Boolean
+        get() = lanes == null && laneWidthMeters == null && widthMeters == null &&
+                shoulderMeters == null && surface == SurfaceKind.UNKNOWN
+
+    /** ความกว้างช่องทางเดินรถ ไม่รวมไหล่ทาง
      *
-     *  ถ้าไม่ได้วัดความกว้างจริง จะประมาณจากจำนวนเลน × 3.5 ม. (มาตรฐานถนนชั้นที่ 2 ของไทย)
-     *  ผลลัพธ์ยังใช้เป็นค่าประมาณการแนว DXF ได้ แต่ควรกรอกความกว้างจริงถ้าตรวจวัดแล้ว
+     *  ลำดับความสำคัญ: กว้างรวมที่วัดจริง > เลน × กว้างต่อเลน > เลน × 3.5 (ค่าประมาณมาตรฐาน)
      */
-    val totalWidthMeters: Double?
-        get() {
-            val base = widthMeters ?: lanes?.let { it * 3.5 }
-            return base?.let { it + (shoulderMeters ?: 0.0) * 2 }
-        }
+    val carriagewayWidthMeters: Double?
+        get() = widthMeters
+            ?: laneWidthMeters?.let { lw -> lanes?.let { l -> l * lw } }
+            ?: lanes?.let { it * DEFAULT_LANE_WIDTH }
+
+    /** ระยะไหล่ทางต่อข้าง (0 = ไม่มี) */
+    val shoulderEachSide: Double get() = (shoulderMeters ?: 0.0).coerceAtLeast(0.0)
+
+    /** ความกว้างรวมช่องทางเดินรถ + ไหล่ทางสองข้าง */
+    val totalWidthMeters: Double? get() = carriagewayWidthMeters?.let { it + shoulderEachSide * 2 }
+
+    /** จำนวนเส้นแบ่งช่องทาง = จำนวนเลน − 1 */
+    val dividerCount: Int get() = ((lanes ?: 1) - 1).coerceAtLeast(0)
 
     fun summary(): String = buildList {
         lanes?.let { add("$it เลน") }
-        widthMeters?.let { add("กว้าง ${trimNum(it)} ม.") }
-            ?: lanes?.let { add("≈${trimNum(it * 3.5)} ม.") }
-        shoulderMeters?.takeIf { it > 0 }?.let { add("ไหล่ทาง ${trimNum(it)} ม.") }
+        if (widthMeters != null) {
+            add("กว้าง ${trimNum(widthMeters)} ม.")
+            laneWidthMeters?.let { add("ต่อเลน ${trimNum(it)}") }
+        } else if (laneWidthMeters != null) {
+            add("ต่อเลน ${trimNum(laneWidthMeters)}")
+            carriagewayWidthMeters?.let { add("≈${trimNum(it)} ม.") }
+        } else {
+            carriagewayWidthMeters?.let { add("≈${trimNum(it)} ม.") }
+        }
+        if (shoulderEachSide > 0) add("ไหล่ทาง ${trimNum(shoulderEachSide)} ม./ข้าง")
         if (surface != SurfaceKind.UNKNOWN) add(SurfaceKind.label(surface))
     }.joinToString(" · ").ifBlank { "ยังไม่มีข้อมูล" }
 
     private fun trimNum(v: Double) =
-        if (v % 1.0 == 0.0) v.toInt().toString() else String.format("%.1f", v)
+        if (v % 1.0 == 0.0) v.toInt().toString() else String.format("%.2f", v)
 }
 
-// ── การหาช่วง ──────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════
+//  การหาช่วง
+// ════════════════════════════════════════════════════════════
 
+/** ช่วงที่ครอบคลุมระยะ [routeMeters] */
 fun List<RoadSegment>.at(routeMeters: Double): RoadSegment? =
     firstOrNull { it.contains(routeMeters) }
 
@@ -139,6 +166,7 @@ fun JunctionPoint.effective(segments: List<RoadSegment>): RoadAttributes {
     val seg = segments.at(nearestChainageMeters)
     return RoadAttributes(
         lanes = lanes ?: seg?.lanes,
+        laneWidthMeters = seg?.laneWidthMeters,
         widthMeters = widthMeters ?: seg?.widthMeters,
         shoulderMeters = shoulderMeters ?: seg?.shoulderMeters,
         surface = if (surface != SurfaceKind.UNKNOWN) surface else seg?.surface ?: SurfaceKind.UNKNOWN,
@@ -161,7 +189,9 @@ fun RoadSegment.dxfLines(startChainage: StartChainageConfig): List<String> = bui
 private fun chainageText(meters: Int) =
     "${meters / 1000}+${(meters % 1000).toString().padStart(3, '0')}"
 
-// ── ตำแหน่งบนเส้นทาง ─────────────────────────────────────────
+// ════════════════════════════════════════════════════════════
+//  ตำแหน่งบนเส้นทาง
+// ════════════════════════════════════════════════════════════
 
 /** จุดที่ใกล้ระยะ [meters] ที่สุด — ใช้ลากหัวช่วงบนแผนที่ */
 fun pointAtChainage(points: List<TrackPoint>, meters: Double): TrackPoint? =
@@ -176,7 +206,9 @@ fun sliceByChainage(
     return points.filter { it.chainageMeters in lo..hi }
 }
 
-// ── เดิม (ไม่เปลี่ยน) ────────────────────────────────────────
+// ════════════════════════════════════════════════════════════
+//  เรขาคณิต
+// ════════════════════════════════════════════════════════════
 
 /** ระยะกม. ของจุดที่ใกล้ [latitude]/[longitude] ที่สุดในเส้นทางที่บันทึกไว้แล้ว */
 fun nearestChainageMeters(points: List<TrackPoint>, latitude: Double, longitude: Double): Double {
@@ -192,6 +224,10 @@ fun haversineMeters(lat1: Double, lng1: Double, lat2: Double, lng2: Double): Dou
     val a = sin(dLat / 2).pow(2) + cos(Math.toRadians(lat1)) * cos(Math.toRadians(lat2)) * sin(dLng / 2).pow(2)
     return 2 * earth * asin(sqrt(a.coerceIn(0.0, 1.0)))
 }
+
+// ════════════════════════════════════════════════════════════
+//  จุดเริ่มต้น / สถานะ
+// ════════════════════════════════════════════════════════════
 
 data class StartChainageConfig(
     val meters: Int = 0,

@@ -5,6 +5,7 @@ import android.net.Uri
 import com.patipan.tripmap.TripMapApplication
 import com.patipan.tripmap.data.JunctionEntity
 import com.patipan.tripmap.data.RoadSegmentEntity
+import com.patipan.tripmap.data.SurfaceKind
 import com.patipan.tripmap.data.TrackPointEntity
 import com.patipan.tripmap.data.TripEntity
 import com.patipan.tripmap.tracking.*
@@ -77,13 +78,14 @@ object TripArchive {
                 }
                 zip.closeEntry()
 
+                // ✅ เพิ่ม laneWidthMeters เป็นคอลัมน์ที่ 5
                 zip.putNextEntry(ZipEntry("road_segments.csv"))
-                zip.write("name,startChainageMeters,endChainageMeters,lanes,widthMeters,shoulderMeters,surface,note,colorIndex\n".toByteArray(StandardCharsets.UTF_8))
+                zip.write("name,startChainageMeters,endChainageMeters,lanes,laneWidthMeters,widthMeters,shoulderMeters,surface,note,colorIndex\n".toByteArray(StandardCharsets.UTF_8))
                 roadSegments.forEach { s ->
                     val line = listOf(
                         csvText(s.name), s.startChainageMeters, s.endChainageMeters, s.lanes,
-                        s.widthMeters ?: "", s.shoulderMeters ?: "", s.surface,
-                        csvText(s.note), s.colorIndex
+                        s.laneWidthMeters ?: "", s.widthMeters ?: "", s.shoulderMeters ?: "",
+                        s.surface, csvText(s.note), s.colorIndex
                     ).joinToString(",") + "\n"
                     zip.write(line.toByteArray(StandardCharsets.UTF_8))
                 }
@@ -133,20 +135,26 @@ object TripArchive {
                                     lanes = v.getOrNull(9)?.toIntOrNull(),
                                     widthMeters = v.getOrNull(10)?.toDoubleOrNull(),
                                     shoulderMeters = v.getOrNull(11)?.toDoubleOrNull(),
-                                    surface = v.getOrNull(12)?.takeIf { it.isNotEmpty() } ?: com.patipan.tripmap.data.SurfaceKind.UNKNOWN,
+                                    surface = v.getOrNull(12)?.takeIf { it.isNotEmpty() } ?: SurfaceKind.UNKNOWN,
                                     photoRef = v.getOrNull(13)?.takeIf { it.isNotEmpty() }
                                 )
                             }
                         }
+                        // ✅ อ่าน 10 คอลัมน์ (เพิ่ม laneWidthMeters ที่ v[4] แล้วเลื่อนที่เหลือ)
                         "road_segments.csv" -> text.lineSequence().drop(1).forEach { line ->
                             val v = splitCsv(line)
-                            if (v.size >= 9) {
+                            if (v.size >= 10) {
                                 segments += RoadSegment(
-                                    name = v[0], startChainageMeters = v[1].toInt(), endChainageMeters = v[2].toInt(),
-                                    lanes = v[3].toInt(), widthMeters = v[4].toDoubleOrNull(),
-                                    shoulderMeters = v[5].toDoubleOrNull(),
-                                    surface = v[6].takeIf { it.isNotEmpty() } ?: com.patipan.tripmap.data.SurfaceKind.UNKNOWN,
-                                    note = v[7], colorIndex = v[8].toInt()
+                                    name = v[0],
+                                    startChainageMeters = v[1].toInt(),
+                                    endChainageMeters = v[2].toInt(),
+                                    lanes = v[3].toInt(),
+                                    laneWidthMeters = v[4].toDoubleOrNull(),
+                                    widthMeters = v[5].toDoubleOrNull(),
+                                    shoulderMeters = v[6].toDoubleOrNull(),
+                                    surface = v[7].takeIf { it.isNotEmpty() } ?: SurfaceKind.UNKNOWN,
+                                    note = v[8],
+                                    colorIndex = v[9].toInt()
                                 )
                             }
                         }
@@ -187,18 +195,30 @@ object TripArchive {
                     shoulderMeters = j.shoulderMeters, surface = j.surface, photoRef = j.photoRef
                 )
             })
+            // ✅ เพิ่ม laneWidthMeters เป็นอาร์กิวเมนต์ที่ 7
             if (imported.roadSegments.isNotEmpty()) imported.roadSegments.forEach { s ->
                 dao.insertSegment(RoadSegmentEntity(
-                    0, id, s.name, s.startChainageMeters, s.endChainageMeters, s.lanes,
-                    s.widthMeters, s.shoulderMeters, s.surface, s.note, s.colorIndex,
-                    s.createdAt, s.updatedAt
+                    id = 0,
+                    tripId = id,
+                    name = s.name,
+                    startChainageMeters = s.startChainageMeters,
+                    endChainageMeters = s.endChainageMeters,
+                    lanes = s.lanes,
+                    laneWidthMeters = s.laneWidthMeters,
+                    widthMeters = s.widthMeters,
+                    shoulderMeters = s.shoulderMeters,
+                    surface = s.surface,
+                    note = s.note,
+                    colorIndex = s.colorIndex,
+                    createdAt = s.createdAt,
+                    updatedAt = s.updatedAt
                 ))
             }
         }
         return id
     }
 
-    /** escape ค่าที่มี comma, quote หรือขึ้นบรรทัดใหม่ เพื่อไม่ให้ CSV แตกคอลัมน์ */
+    /** escape ค่าที่มี comma, quote หรือขึ้นบรรทัดใหม่ เพื่อไมให้ CSV แตกคอลัมน์ */
     private fun csvText(value: String): String =
         if (value.any { it == ',' || it == '"' || it == '\n' || it == '\r' }) {
             "\"" + value.replace("\"", "\"\"") + "\""
