@@ -25,7 +25,7 @@ object DxfExporter {
         val includeLaneDivider: Boolean = true,
         val includeChainage: Boolean = true,
         val includeJunctions: Boolean = true,
-        val includeNotes: Boolean = false
+        val includeNotes: Boolean = true
     )
 
     data class Result(val file: File, val utmZoneLabel: String)
@@ -37,6 +37,9 @@ object DxfExporter {
         val toMeters: Double,
         val points: List<TrackPoint>
     )
+
+    /** ช่วงของเส้นทางหนึ่งช่วง พร้อมแขนแยกที่อยู่ในช่วงนั้น */
+    private data class Branch(val centerline: List<RoadGeometry.Pt>, val chainage: Double)
 
     /** ชื่อ layer ของช่วงถนน: ROAD_SEG_01, ROAD_SEG_02, …
      *  ชื่อช่วงจริงจะไปอยู่ใน TEXT แทน เพราะชื่อ layer ของ DXF จำกัด 31 ตัวอักษรและห้ามมีอักษรพิเศษ
@@ -70,17 +73,13 @@ object DxfExporter {
 
         val routeXy = points.map { project(it.latitude, it.longitude) }
         val baseHalfWidth = options.roadWidthMeters / 2
-
         val spans = buildSpans(points, segments, maxChain)
 
         // ── แขนแยก: จัดเข้าช่วงตามระยะของจุดทางแยก ──
-        data class Branch(val centerline: List<RoadGeometry.Pt>, val chainage: Double)
-        val branches = junctions.mapNotNull { j ->
+        val branches: List<Branch> = junctions.flatMap { j ->
             val jXy = project(j.latitude, j.longitude)
             val (basePt, tangent) = RoadGeometry.nearestPointAndTangent(routeXy, jXy)
             val normal = RoadGeometry.Pt(-tangent.y, tangent.x)
-            val attrs = j.effective(segments)
-            val branchWidth = (attrs.totalWidthMeters ?: options.branchWidthMeters).coerceIn(2.0, 30.0)
             val sides = when (j.side) {
                 JunctionSide.RIGHT -> listOf(-1.0)
                 JunctionSide.LEFT -> listOf(1.0)
@@ -98,7 +97,7 @@ object DxfExporter {
                     chainage = j.nearestChainageMeters
                 )
             }
-        }.flatten()
+        }
 
         val junctionLabels = mutableListOf<Pair<RoadGeometry.Pt, String>>()
         val junctionNotes = mutableListOf<Pair<RoadGeometry.Pt, String>>()
@@ -114,6 +113,7 @@ object DxfExporter {
         val writer = DxfWriter()
         writer.defineLayer("ROUTE_CENTERLINE", 5)
         writer.defineLayer("ROAD_EDGE", 7)
+        writer.defineLayer("SHOULDER_EDGE", 8)
         writer.defineLayer("LANE_DIVIDER", 2, "DASHED")
         writer.defineLayer("CHAINAGE_LEADER", 1)
         writer.defineLayer("CHAINAGE_TEXT", 1)
@@ -142,7 +142,13 @@ object DxfExporter {
             val layer = seg?.let { segmentLayerName(segments.indexOf(it)) } ?: "ROAD_EDGE"
             val attrs = seg?.attributes()
                 ?: RoadAttributes(lanes = options.lanes, widthMeters = options.roadWidthMeters, surface = SurfaceKind.UNKNOWN)
-            val halfWidth = ((attrs.totalWidthMeters ?: options.roadWidthMeters) / 2).coerceIn(1.0, 30.0)
+
+            // ความกว้างช่องทางเดินรถ (ไม่รวมไหล่ทาง) — ใช้วางขอบ/เส้นแบ่งด้วย
+            val carriageway = attrs.carriagewayWidthMeters ?: options.roadWidthMeters
+            val totalWidth = attrs.totalWidthMeters ?: options.roadWidthMeters
+            val halfWidth = (totalWidth / 2).coerceIn(1.0, 30.0)
+            val halfCarriage = (carriageway / 2).coerceIn(0.5, 30.0)
+
             val centerLine = span.points.map { project(it.latitude, it.longitude) }
             if (centerLine.size < 2) return@forEach
 
@@ -151,31 +157,65 @@ object DxfExporter {
             }
 
             if (options.includeRoadEdge) {
+                // ── ขอบถนน: ลองผ่าน JTS ก่อน (โค้งมุมสวย) ──
                 val polygons = buildList {
                     add(RoadGeometry.roadPolygon(centerLine, halfWidth))
-                    spanBranches.forEach {
-                        add(RoadGeometry.roadPolygon(it.centerline, halfWidth))
-                    }
+                    spanBranches.forEach { add(RoadGeometry.roadPolygon(it.centerline, halfWidth)) }
                 }
-                val merged = RoadGeometry.unionAll(polygons)
-                val smoothed = RoadGeometry.smooth(merged, options.cornerSmoothingMeters)
+                val smoothed = RoadGeometry.smooth(RoadGeometry.unionAll(polygons), options.cornerSmoothingMeters)
                 val surfacePolys = RoadGeometry.surfacePolygons(smoothed)
 
-                // ตัดปลายเฉพาะที่เป็นอิสระจริง ๆ: ต้นทาง/ปลายทางของเส้นทาง + ปลายแขนแยก
-                // ขอบเขตระหว่างช่วง (ที่ความกว้างเปลี่ยน) ต้องคงไว้ เพราะเป็นรอยต่อจริงของงานสำรวจ
                 val freeEnds = buildList {
                     if (span.fromMeters <= 0.0) add(centerLine.first())
                     if (span.toMeters >= maxChain) add(centerLine.last())
                     spanBranches.forEach { add(it.centerline.last()) }
                 }
                 val capRadius = halfWidth + options.cornerSmoothingMeters + 3.0
-                RoadGeometry.trimCaps(surfacePolys, freeEnds, capRadius).forEach { chain ->
-                    writer.writePolyline(layer, chain.map { doubleArrayOf(it.x, it.y) })
+                val chains = RoadGeometry.trimCaps(surfacePolys, freeEnds, capRadius)
+
+                var drawn = 0
+                chains.forEach { chain ->
+                    if (chain.size > 1) {
+                        writer.writePolyline(layer, chain.map { doubleArrayOf(it.x, it.y) })
+                        drawn++
+                    }
+                }
+
+                // ── ตาข่ายนิรภัย: ถ้า JTS ไม่ได้ผลเลย ใช้การออฟเซ็ตตรง ──
+                if (drawn == 0) {
+                    RoadGeometry.edgeLines(centerLine, halfWidth).forEach { edge ->
+                        if (edge.size > 1) {
+                            writer.writePolyline(layer, edge.map { doubleArrayOf(it.x, it.y) })
+                        }
+                    }
+                    spanBranches.forEach { b ->
+                        RoadGeometry.edgeLines(b.centerline, halfWidth).forEach { edge ->
+                            if (edge.size > 1) {
+                                writer.writePolyline(layer, edge.map { doubleArrayOf(it.x, it.y) })
+                            }
+                        }
+                    }
                 }
             }
 
+            // ── ขอบไหล่ทาง: เส้นคั่นระหว่างช่องทางเดินรถกับไหล่ทาง ──
+            if (options.includeRoadEdge && attrs.shoulderEachSide > 0) {
+                RoadGeometry.shoulderEdgeOffsets(carriageway, attrs.shoulderEachSide).forEach { off ->
+                    val edge = RoadGeometry.offsetPolyline(centerLine, off)
+                    if (edge.size > 1) {
+                        writer.writePolyline("SHOULDER_EDGE", edge.map { doubleArrayOf(it.x, it.y) })
+                    }
+                }
+            }
+
+            // ── เส้นแบ่งช่องทาง: อยู่กลางช่องทางเดินรถ จำนวนเลน−1 เส้น ──
             if (options.includeLaneDivider && (attrs.lanes ?: 0) >= 2) {
-                writer.writePolyline(layer, centerLine.map { doubleArrayOf(it.x, it.y) }, linetype = "DASHED")
+                RoadGeometry.laneDividerOffsets(attrs.lanes ?: 2, carriageway).forEach { off ->
+                    val line = RoadGeometry.offsetPolyline(centerLine, off)
+                    if (line.size > 1) {
+                        writer.writePolyline(layer, line.map { doubleArrayOf(it.x, it.y) }, linetype = "DASHED")
+                    }
+                }
             }
 
             if (seg != null && options.includeNotes) {

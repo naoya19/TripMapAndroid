@@ -8,7 +8,9 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
@@ -137,13 +139,11 @@ private fun TripScreen(
     val draft = segmentDraft
     val draftVisible = draft != null && layerState.drawMode && layerState.showSegments
 
-    // เก็บค่าล่าสุดไว้ให้แอนิเมชันซ่อน — ถ้าดึง draft ตรง ๆ จะเป็น null แล้ว !! แตก
     var shownDraft by remember { mutableStateOf<SegmentDraft?>(null) }
     LaunchedEffect(draft) { if (draft != null) shownDraft = draft }
 
     Box(modifier.fillMaxSize()) {
 
-        // ── แผนที่ ──
         RealtimeMap(
             points = state.points,
             junctions = state.junctions,
@@ -172,7 +172,6 @@ private fun TripScreen(
             onUndo = { segmentDraft = segmentDraft?.undo() }
         )
 
-        // ── HUD ──
         Column(
             Modifier.align(Alignment.TopCenter).fillMaxWidth().padding(horizontal = 10.dp, vertical = 10.dp),
             verticalArrangement = Arrangement.spacedBy(6.dp)
@@ -200,18 +199,12 @@ private fun TripScreen(
             }
         }
 
-        // ── แผงล่าง ──
         Column(Modifier.align(Alignment.BottomCenter).fillMaxWidth()) {
-            // ใช้ shownDraft แทน draft — ตอนกดยกเลิก draft จะ null ทันที
             AnimatedVisibility(visible = shownDraft != null && layerState.drawMode && layerState.showSegments) {
                 shownDraft?.let { sd ->
                     DraftInfoBar(
-                        draft = sd,
-                        config = active,
-                        onCancel = {
-                            segmentDraft = null
-                            shownDraft = null
-                        }
+                        draft = sd, config = active,
+                        onCancel = { segmentDraft = null; shownDraft = null }
                     )
                 }
             }
@@ -241,11 +234,9 @@ private fun TripScreen(
         }
     }
 
-    // ── กล่องแก้ไข ──
     editJunction?.let { j ->
         JunctionEditDialog(
-            junction = j,
-            segments = state.roadSegments,
+            junction = j, segments = state.roadSegments,
             onDismiss = { editJunction = null },
             onSave = { TrackingBus.updateJunction(it); editJunction = null },
             onDelete = { TrackingBus.removeJunction(j.id); editJunction = null }
@@ -254,8 +245,7 @@ private fun TripScreen(
 
     editSegment?.let { seg ->
         RoadSegmentDialog(
-            segment = seg,
-            config = active,
+            segment = seg, config = active,
             onDismiss = { editSegment = null },
             onSave = { TrackingBus.replaceSegmentRange(it); editSegment = null },
             onDelete = { TrackingBus.removeSegment(seg.id); editSegment = null }
@@ -266,8 +256,7 @@ private fun TripScreen(
         draft?.let { d ->
             if (d.end != null) {
                 DraftActionsBar(
-                    draft = d,
-                    config = active,
+                    draft = d, config = active,
                     onCancel = { segmentDraft = null; shownDraft = null },
                     onContinue = {
                         val e = d.end!!
@@ -338,7 +327,7 @@ private fun LayersPanel(
             LayerRow("📊 ช่วงของถนน ($segmentCount)", "ROAD_SEG_xx", layerState.showSegments) { onToggle(layerState.copy(showSegments = it)) }
             Text(
                 if (layerState.drawMode) "โหมดวาด: แตะที่แผนที่ 2 ครั้งเพื่อกำหนดจุดเริ่มและจุดจบของช่วง"
-                else "โหมดดู: แตะจุดทางแยกเพื่อดูหรือแก้ไข",
+                else "โมดดู: แตะจุดทางแยกเพื่อดูหรือแก้ไข",
                 style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary
             )
         }
@@ -369,7 +358,6 @@ data class SegmentDraft(val start: Double, val end: Double? = null) {
     fun undo() = if (end != null) SegmentDraft(start) else null
 }
 
-/** แถบข้อความบอกสถานะตอนกำลังกำหนดช่วง — เส้น/จุดถูกวาดในแผนที่แล้ว */
 @Composable
 private fun DraftInfoBar(
     draft: SegmentDraft,
@@ -456,15 +444,25 @@ private fun RoadSegmentDialog(
     var surface by remember { mutableStateOf(segment.surface) }
     var note by remember { mutableStateOf(segment.note) }
 
-    val attrs = RoadAttributes(lanes, laneWidth.toDoubleOrNull(), width.toDoubleOrNull(), shoulder.toDoubleOrNull(), surface, name.ifBlank { null })
+    val attrs = RoadAttributes(
+        lanes, laneWidth.toDoubleOrNull(), width.toDoubleOrNull(),
+        shoulder.toDoubleOrNull(), surface, name.ifBlank { null }
+    )
     val lengthM = (end - start).coerceAtLeast(0)
+    val laneW = laneWidth.toDoubleOrNull() ?: RoadAttributes.DEFAULT_LANE_WIDTH
+    val carriage = attrs.carriagewayWidthMeters
+    val total = attrs.totalWidthMeters
 
     AlertDialog(
         onDismissRequest = onDismiss,
         icon = { Icon(Icons.Default.Straighten, null) },
         title = { Text(if (segment.id == 0L) "เพิ่มช่วงของถนน" else "แก้ไขช่วงของถนน") },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            // ✅เพิ่ม scroll — เนื้อหาเยอะต้องเลื่อนได้
+            Column(
+                Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
                 Surface(color = MaterialTheme.colorScheme.secondaryContainer, shape = RoundedCornerShape(8.dp)) {
                     Column(Modifier.padding(10.dp)) {
                         Text(
@@ -474,7 +472,12 @@ private fun RoadSegmentDialog(
                         Text("ความยาว $lengthM เมตร (${String.format("%.2f", lengthM / 1000.0)} กม.)", style = MaterialTheme.typography.labelSmall)
                     }
                 }
-                OutlinedTextField(name, { name = it.take(60) }, Modifier.fillMaxWidth(), label = { Text("ชื่อช่วง (ใช้เป็นชื่อชั้นใน DXF)") }, singleLine = true)
+
+                OutlinedTextField(
+                    name, { name = it.take(60) }, Modifier.fillMaxWidth(),
+                    label = { Text("ชื่อช่วง (ใช้เป็นชื่อชั้นใน DXF)") }, singleLine = true
+                )
+
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedTextField(
                         start.toString(), { start = it.filter(Char::isDigit).toIntOrNull() ?: 0 },
@@ -485,50 +488,99 @@ private fun RoadSegmentDialog(
                         Modifier.weight(1f), label = { Text("จบ (เมตร)") }, singleLine = true
                     )
                 }
+
+                // ✅ ชิป 5 อันเท่ากัน — weight(1f) ไม่ล้น
                 Text("จำนวนเลน (ต่อทิศทาง)", style = MaterialTheme.typography.labelMedium)
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    (1..5).forEach { n ->
+                        FilterChip(
+                            selected = lanes == n,
+                            onClick = { lanes = n },
+                            label = { Text(if (n == 5) "5+" else "$n", style = MaterialTheme.typography.labelMedium, maxLines = 1) },
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                }
+
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedTextField(
                         laneWidth, { laneWidth = it.filter { c -> c.isDigit() || c == '.' }.take(5) },
-                        Modifier.weight(1f), label = { Text("กว้าง/เลน (ม.)") }, singleLine = true
+                        Modifier.weight(1f),
+                        label = { Text("กว้าง/เลน (ม.)") },
+                        supportingText = { Text("ว่าง = 3.5") }, singleLine = true
                     )
                     OutlinedTextField(
                         shoulder, { shoulder = it.filter { c -> c.isDigit() || c == '.' }.take(4) },
-                        Modifier.weight(1f), label = { Text("ไหล่ทาง/ข้าง (ม.)") }, singleLine = true
+                        Modifier.weight(1f),
+                        label = { Text("ไหล่ทาง/ข้าง (ม.)") },
+                        supportingText = { Text("ว่าง = ไม่มี") }, singleLine = true
                     )
                 }
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                    OutlinedTextField(
-                        width, { width = it.filter { c -> c.isDigit() || c == '.' }.take(5) },
-                        Modifier.weight(1f), label = { Text("กว้างรวม (ถ้าวัดแล้ว)") }, singleLine = true
-                    )
-                    Text(
-                        attrs.carriagewayWidthMeters?.let { "= ${fmtNum(it)} ม." } ?: "= -",
-                        style = MaterialTheme.typography.bodyMedium,
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.padding(top = 18.dp)
-                    )
-                }
-                Text(
-                    "กรอก “กว้าง/เลน” หรือเว้นว่างไว้ (ใช้ 3.5 ม. ต่อช่องทาง) · ถ้าวัดได้ให้กรอก “กว้างรวม” จะใช้ค่านั้นแทน",
-                    style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline
+
+                OutlinedTextField(
+                    width, { width = it.filter { c -> c.isDigit() || c == '.' }.take(5) },
+                    Modifier.fillMaxWidth(),
+                    label = { Text("กว้างรวม (ถ้าวัดแล้ว)") },
+                    supportingText = { Text("ว่าง = คำนวณจากเลน × กว้าง/เลน") }, singleLine = true
                 )
-                Text("ผิวถนน", style = MaterialTheme.typography.labelMedium)
-                Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                    FilterChip(surface == SurfaceKind.UNKNOWN, { surface = SurfaceKind.UNKNOWN }, label = { Text("ยังไม่ระบุ", style = MaterialTheme.typography.labelSmall) })
-                }
-                Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                    SurfaceKind.all.forEach { s ->
-                        FilterChip(surface == s, { surface = s }, label = { Text(SurfaceKind.label(s), style = MaterialTheme.typography.labelSmall) })
+
+                // ✅ สูตรชัดเจน ไม่ต้องเดาเอง
+                Surface(color = Color(0xFFEFF8F1), shape = RoundedCornerShape(8.dp)) {
+                    Column(Modifier.padding(10.dp)) {
+                        Text(
+                            "▣ กว้างช่องทางเดินรถ = $lanes × ${fmtNum(laneW)} = ${carriage?.let { fmtNum(it) } ?: "-"} ม.",
+                            style = MaterialTheme.typography.labelSmall, color = Color(0xFF1F5C3D)
+                        )
+                        Text(
+                            "▣ ไหล่ทาง 2 ข้าง = ${shoulder.toDoubleOrNull()?.let { fmtNum(it * 2) } ?: "0.00"} ม.",
+                            style = MaterialTheme.typography.labelSmall, color = Color(0xFF1F5C3D)
+                        )
+                        Divider(Modifier.padding(vertical = 4.dp), color = Color(0xFFB7DCC4))
+                        Text(
+                            "▣ กว้างรวม = ${total?.let { fmtNum(it) } ?: "-"} ม. · ${attrs.summary()}",
+                            fontWeight = FontWeight.Bold,
+                            style = MaterialTheme.typography.labelMedium, color = Color(0xFF1F5C3D)
+                        )
                     }
                 }
-                OutlinedTextField(note, { note = it.take(300) }, Modifier.fillMaxWidth(), label = { Text("หมายเหตุภาคสนาม") }, minLines = 2)
-                Surface(color = Color(0xFFEFF8F1), shape = RoundedCornerShape(8.dp)) {
-                    Text(
-                        "▣ สรุป: ${attrs.summary()}\n▣ กว้างรวมช่องทาง+ไหล่ทาง ${attrs.totalWidthMeters?.let { "${fmtNum(it)} ม." } ?: "-"}",
-                        Modifier.padding(10.dp), style = MaterialTheme.typography.labelSmall, color = Color(0xFF1F5C3D)
-                    )
+
+                // ✅ ผิวถนน 5 ชิปแบ่ง 2 แถว ไม่ล้น
+                Text("ผิวถนน", style = MaterialTheme.typography.labelMedium)
+                val surfaces = listOf(
+                    SurfaceKind.UNKNOWN to "ไม่ระบุ",
+                    SurfaceKind.ASPHALT to "Asphalt",
+                    SurfaceKind.CONCRETE to "คอนกรีต",
+                    SurfaceKind.GRAVEL to "ลูกรัง",
+                    SurfaceKind.DIRT to "ดิน"
+                )
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        surfaces.take(3).forEach { (value, text) ->
+                            FilterChip(
+                                selected = surface == value,
+                                onClick = { surface = value },
+                                label = { Text(text, style = MaterialTheme.typography.labelSmall, maxLines = 1) },
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        surfaces.drop(3).forEach { (value, text) ->
+                            FilterChip(
+                                selected = surface == value,
+                                onClick = { surface = value },
+                                label = { Text(text, style = MaterialTheme.typography.labelSmall, maxLines = 1) },
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
+                    }
                 }
+
+                OutlinedTextField(
+                    note, { note = it.take(300) }, Modifier.fillMaxWidth(),
+                    label = { Text("หมายเหตุภาคสนาม") }, minLines = 2
+                )
+
                 TextButton(onDelete) { Text("ลบช่วงนี้", color = MaterialTheme.colorScheme.error) }
             }
         },
@@ -581,7 +633,10 @@ private fun JunctionEditDialog(
         icon = { Icon(Icons.Default.Place, null) },
         title = { Text("แก้ไขจุดทางแยก") },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Column(
+                Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
                 Surface(color = MaterialTheme.colorScheme.secondaryContainer, shape = RoundedCornerShape(8.dp)) {
                     Column(Modifier.padding(10.dp)) {
                         Text("กม.${junction.nearestChainageMeters.toInt()}", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.bodySmall)
@@ -593,23 +648,51 @@ private fun JunctionEditDialog(
                         )
                     }
                 }
+
                 Text("ประเภท", style = MaterialTheme.typography.labelMedium)
-                Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                    JunctionType.entries.forEach { t ->
-                        FilterChip(type == t, { type = t }, label = { Text(t.label(), style = MaterialTheme.typography.labelSmall) })
+                // ✅ 4 ชิปแบ่ง 2 แถว กันล้น
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        listOf(JunctionType.THREE_WAY, JunctionType.FOUR_WAY).forEach { t ->
+                            FilterChip(
+                                selected = type == t, onClick = { type = t },
+                                label = { Text(t.label(), style = MaterialTheme.typography.labelSmall, maxLines = 1) },
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        listOf(JunctionType.T, JunctionType.LEFT_TURN).forEach { t ->
+                            FilterChip(
+                                selected = type == t, onClick = { type = t },
+                                label = { Text(t.label(), style = MaterialTheme.typography.labelSmall, maxLines = 1) },
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
                     }
                 }
+
                 if (type == JunctionType.THREE_WAY || type == JunctionType.T) {
                     Text("แขนแยกอยู่ด้าน", style = MaterialTheme.typography.labelMedium)
-                    Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                        FilterChip(side == JunctionSide.LEFT, { side = JunctionSide.LEFT }, label = { Text("ซ้าย", style = MaterialTheme.typography.labelSmall) })
-                        FilterChip(side == JunctionSide.RIGHT, { side = JunctionSide.RIGHT }, label = { Text("ขวา", style = MaterialTheme.typography.labelSmall) })
-                        FilterChip(side == JunctionSide.BOTH, { side = JunctionSide.BOTH }, label = { Text("ทั้งสอง", style = MaterialTheme.typography.labelSmall) })
+                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        listOf(
+                            JunctionSide.LEFT to "ซ้าย",
+                            JunctionSide.RIGHT to "ขวา",
+                            JunctionSide.BOTH to "ทั้งสอง"
+                        ).forEach { (value, text) ->
+                            FilterChip(
+                                selected = side == value, onClick = { side = value },
+                                label = { Text(text, style = MaterialTheme.typography.labelSmall, maxLines = 1) },
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
                     }
                 } else {
                     Text("4 แยก จะตั้งแขนแยกทั้งสองด้านให้อัตโนมัติ", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline)
                 }
+
                 Divider()
+
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) {
                         Text("วัดค่าถนนเฉพาะจุดนี้", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
@@ -620,22 +703,45 @@ private fun JunctionEditDialog(
                     }
                     Switch(override, { override = it })
                 }
+
                 if (override) {
                     Text("จำนวนเลน", style = MaterialTheme.typography.labelMedium)
-                    Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                        (1..5).forEach { n -> FilterChip(lanes == n, { lanes = n }, label = { Text(if (n == 5) "5+" else "$n") }) }
+                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        (1..5).forEach { n ->
+                            FilterChip(
+                                selected = lanes == n, onClick = { lanes = n },
+                                label = { Text(if (n == 5) "5+" else "$n", maxLines = 1) },
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
                     }
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         OutlinedTextField(width, { width = it.filter { c -> c.isDigit() || c == '.' }.take(5) }, Modifier.weight(1f), label = { Text("กว้าง (ม.)") }, singleLine = true)
                         OutlinedTextField(shoulder, { shoulder = it.filter { c -> c.isDigit() || c == '.' }.take(4) }, Modifier.weight(1f), label = { Text("ไหล่ทาง (ม.)") }, singleLine = true)
                     }
                     Text("ผิวถนน", style = MaterialTheme.typography.labelMedium)
-                    Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                        SurfaceKind.all.forEach { s ->
-                            FilterChip(surface == s, { surface = s }, label = { Text(SurfaceKind.label(s), style = MaterialTheme.typography.labelSmall) })
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                            SurfaceKind.all.take(3).forEach { s ->
+                                FilterChip(
+                                    selected = surface == s, onClick = { surface = s },
+                                    label = { Text(SurfaceKind.label(s), style = MaterialTheme.typography.labelSmall, maxLines = 1) },
+                                    modifier = Modifier.weight(1f)
+                                )
+                            }
+                        }
+                        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                            SurfaceKind.all.drop(3).forEach { s ->
+                                FilterChip(
+                                    selected = surface == s, onClick = { surface = s },
+                                    label = { Text(SurfaceKind.label(s), style = MaterialTheme.typography.labelSmall, maxLines = 1) },
+                                    modifier = Modifier.weight(1f)
+                                )
+                            }
                         }
                     }
                 }
+
                 OutlinedTextField(note, { note = it.take(300) }, Modifier.fillMaxWidth(), label = { Text("หมายเหตุภาคสนาม") }, minLines = 2)
                 OutlinedTextField(photoRef, { photoRef = it.take(200) }, Modifier.fillMaxWidth(), label = { Text("รหัสรูปอ้างอิง") }, singleLine = true)
                 TextButton(onDelete) { Text("ลบจุดนี้", color = MaterialTheme.colorScheme.error) }
@@ -843,7 +949,7 @@ private fun MapsDiagnosticsDialog(context: Context, onDismiss: () -> Unit) {
         title = { Text("ตรวจสอบ Google Maps") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text("นำค่า 2 รายการนี้ไปใส่ใน Google Cloud Console ให้ตรงทุกตัว")
+                Text("นำค่า 2 รายการนี้ไปใส่ใน Google Cloud Console ให่ตรงทุกตัว")
                 Text("Package name", style = MaterialTheme.typography.labelSmall)
                 Text(context.packageName, fontWeight = FontWeight.SemiBold)
                 Text("SHA-1 ของแอปที่ติดตั้ง", style = MaterialTheme.typography.labelSmall)
@@ -915,7 +1021,6 @@ private fun RealtimeMap(
         }
     }
 
-    // เส้นของช่วงที่กำลังลาก — คำนวณนอก GoogleMap แต่วาดข้างใน
     val draftLo = draft?.let { minOf(it.start, it.end ?: it.start) } ?: 0.0
     val draftHi = draft?.let { maxOf(it.start, it.end ?: it.start) } ?: 0.0
     val draftCoords = remember(points, draftLo, draftHi) {
@@ -958,13 +1063,7 @@ private fun RealtimeMap(
             }
 
             if (draft != null && draftCoords.size > 1) {
-                Polyline(
-                    points = draftCoords,
-                    color = Color(0xFFF2A03D),
-                    width = 18f,
-                    zIndex = 30f,
-                    geodesic = true
-                )
+                Polyline(points = draftCoords, color = Color(0xFFF2A03D), width = 18f, zIndex = 30f, geodesic = true)
             }
             if (draft != null && draft.end != null) {
                 listOf(draft.start, draft.end!!).forEach { c ->
@@ -1048,8 +1147,7 @@ private fun RealtimeMap(
                     id = System.nanoTime(),
                     latitude = latLng.latitude,
                     longitude = latLng.longitude,
-                    type = type,
-                    side = side,
+                    type = type, side = side,
                     source = JunctionSource.MANUAL,
                     nearestChainageMeters = nearestChainageMeters(points, latLng.latitude, latLng.longitude)
                 ))
@@ -1146,7 +1244,7 @@ private fun Stat(label: String, value: String, modifier: Modifier = Modifier, hu
 }
 
 // ════════════════════════════════════════════════════════════
-//  ตัวช่วย
+// ตัวช่วย
 // ════════════════════════════════════════════════════════════
 
 data class ChainageMarker(val routeMeters: Int, val displayMeters: Int, val point: TrackPoint)
@@ -1165,7 +1263,6 @@ private fun chainageMarkers(points: List<TrackPoint>, interval: Int = 100, confi
     return result
 }
 
-/** ลดจำนวนจุดที่ส่งให้ Google Maps วาดเส้น เพื่อให้แผนที่ลื่นเมื่อทริปยาว — ข้อมูลเต็มยังอยู่ใน Room ครบ */
 private fun decimatePoints(points: List<TrackPoint>, maxPoints: Int = 600): List<TrackPoint> {
     if (points.size <= maxPoints) return points
     val step = ((points.size + maxPoints - 1) / maxPoints).coerceAtLeast(1)
@@ -1210,7 +1307,6 @@ private fun durationText(milliseconds: Long): String {
     return "%02d:%02d".format(totalSeconds / 60, totalSeconds % 60)
 }
 
-/** สีมาตรฐาน AutoCAD ACI — ใช้เดียวกันทั้งบนแผนที่และใน DXF จะได้ตรงกัน */
 private fun aciColor(index: Int) = when (index % 8) {
     1 -> Color(0xFFDE4B45)
     2 -> Color(0xFFE8963D)
@@ -1332,7 +1428,6 @@ private fun HistoryDetailScreen(
     var editSegment by remember { mutableStateOf<RoadSegment?>(null) }
     var showSegments by remember { mutableStateOf(true) }
 
-    // ✅ โหมดวาดในหน้าประวัติ — แก้ช่วงที่บันทึกไว้แล้วได้
     var drawMode by remember(trip.id) { mutableStateOf(false) }
     var draft by remember { mutableStateOf<SegmentDraft?>(null) }
     var shownDraft by remember { mutableStateOf<SegmentDraft?>(null) }
@@ -1361,8 +1456,7 @@ private fun HistoryDetailScreen(
             HistoryMap(
                 points, junctions, Modifier.weight(1f), tripConfig,
                 roadSegments = segments, showSegments = showSegments,
-                drawMode = drawMode,
-                draft = draft,
+                drawMode = drawMode, draft = draft,
                 onMapTap = { latLng ->
                     if (points.size > 1) {
                         val c = nearestChainageMeters(points, latLng.latitude, latLng.longitude)
@@ -1376,14 +1470,11 @@ private fun HistoryDetailScreen(
                 onUndo = { draft = draft?.undo() }
             )
 
-            // แถบบอกสถานะตอนกำลังกำหนดช่วง
             AnimatedVisibility(visible = shownDraft != null && drawMode) {
                 shownDraft?.let { sd ->
                     DraftInfoBar(
-                        draft = sd,
-                        config = tripConfig,
-                        onCancel = { draft = null; shownDraft = null },
-                        compact = true
+                        draft = sd, config = tripConfig, compact = true,
+                        onCancel = { draft = null; shownDraft = null }
                     )
                 }
             }
@@ -1391,8 +1482,7 @@ private fun HistoryDetailScreen(
                 draft?.let { d ->
                     if (d.end != null) {
                         DraftActionsBar(
-                            draft = d,
-                            config = tripConfig,
+                            draft = d, config = tripConfig,
                             onCancel = { draft = null; shownDraft = null },
                             onContinue = {
                                 val e = d.end!!
@@ -1423,7 +1513,7 @@ private fun HistoryDetailScreen(
                 if (segments.isEmpty()) {
                     Text(
                         if (drawMode) "โหมดวาดเปิดอยู่ — แตะแผนที่ 2 ครั้งเพื่อกำหนดช่วงใหม่"
-                        else "ยังไม่มีข้อมูลช่วงถนน — กด ✏️ บนแถบบนเพื่อวาดบนแผนที่ หรือกดเพิ่มเพื่อกรอกค่าเอง",
+                        else "ยังไม่มีข้อมูลช่วงถนน — กด ✏️ บนแถบบนเพื่อวาดบนแผนที่ หรือกดเพิ่มเพื่อกรอกค่าเ",
                         style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline
                     )
                 } else {
@@ -1539,7 +1629,7 @@ private fun ExportDialog(
         onDismissRequest = onDismiss,
         title = { Text("กำหนดช่วงก่อน Export") },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text("เลือกช่วงหลัก กม. ที่ต้องการส่งออก และเลือกระยะป้าย", style = MaterialTheme.typography.bodySmall)
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedTextField(startText, { startText = it.filter { c -> c.isDigit() || c == '+' }.take(12) }, Modifier.weight(1f), label = { Text("เริ่ม เช่น 9+500") }, singleLine = true)
@@ -1555,8 +1645,14 @@ private fun ExportDialog(
                     FilterChip(interval == 100, { interval = 100 }, label = { Text("รายละเอียด · ทุก 100 ม.") })
                 }
                 Text("รูปแบบ", fontWeight = FontWeight.SemiBold)
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    ReportFormat.entries.forEach { f -> FilterChip(format == f, { format = f }, label = { Text(f.name) }) }
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    ReportFormat.entries.forEach { f ->
+                        FilterChip(
+                            selected = format == f, onClick = { format = f },
+                            label = { Text(f.name, maxLines = 1) },
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
                 }
             }
         },
@@ -1612,10 +1708,6 @@ private fun tripDisplayName(trip: TripEntity): String = trip.name.ifBlank {
     "ทริป ${SimpleDateFormat("d MMM yyyy HH:mm", Locale("th", "TH")).format(Date(trip.startedAt))}"
 }
 
-// ════════════════════════════════════════════════════════════
-//  แผนที่ (หน้าประวัติ) — รองรับโหมดวาด
-// ════════════════════════════════════════════════════════════
-
 @Composable
 private fun HistoryMap(
     points: List<TrackPoint>,
@@ -1656,7 +1748,6 @@ private fun HistoryMap(
         }
     }
 
-    // เส้นของช่วงที่กำลังลาก
     val draftLo = draft?.let { minOf(it.start, it.end ?: it.start) } ?: 0.0
     val draftHi = draft?.let { maxOf(it.start, it.end ?: it.start) } ?: 0.0
     val draftCoords = remember(points, draftLo, draftHi) {
