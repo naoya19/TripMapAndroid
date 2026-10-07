@@ -113,7 +113,9 @@ object DxfExporter {
         val writer = DxfWriter()
         writer.defineLayer("ROUTE_CENTERLINE", 5)
         writer.defineLayer("ROAD_EDGE", 7)
-        writer.defineLayer("SHOULDER_EDGE", 8)
+        // สีเดิม 8 (เทาเข้ม) แทบมองไม่เห็นบนพื้นหลังดำของโปรแกรมดู DXF บนมือถือหลายตัว — เปลี่ยนเป็น
+        // 3 (เขียว) ให้ตัดกับเส้นอื่นชัดเจน (เส้นกึ่งกลาง=5 น้ำเงิน, เส้นแบ่งเลน=2 เหลือง)
+        writer.defineLayer("SHOULDER_EDGE", 3)
         writer.defineLayer("LANE_DIVIDER", 2, "DASHED")
         writer.defineLayer("CHAINAGE_LEADER", 1)
         writer.defineLayer("CHAINAGE_TEXT", 1)
@@ -173,16 +175,23 @@ object DxfExporter {
                 val capRadius = halfWidth + options.cornerSmoothingMeters + 3.0
                 val chains = RoadGeometry.trimCaps(surfacePolys, freeEnds, capRadius)
 
-                var drawn = 0
-                chains.forEach { chain ->
-                    if (chain.size > 1) {
-                        writer.writePolyline(layer, chain.map { doubleArrayOf(it.x, it.y) })
-                        drawn++
-                    }
-                }
+                // ── ตรวจว่าผล JTS ดูสมเหตุสมผลก่อนวาดจริง ──
+                // ปัญหาที่พบ: กับเส้นทางยาวมาก (เช่น 40+ กม.) union/buffer/trim บางครั้งพังแบบเงียบ ๆ
+                // แล้วคืน polygon เศษเล็ก ๆ ที่ผิดรูป (เช่น สี่เหลี่ยมใกล้จุด (0,0) ไม่กี่สิบจุด) แทนที่จะเป็น
+                // ขอบถนนจริงหลายพันจุดตลอดเส้นทาง — เดิมเช็คแค่ "วาดอะไรได้บ้างไหม" (drawn>0) ซึ่งเศษพัง ๆ
+                // นี้ก็นับว่า "วาดได้" ทำให้ตาข่ายนิรภัยไม่ทำงาน สุดท้ายขอบถนนทั้งเส้นหายไปเงียบ ๆ
+                // เปลี่ยนมาเช็คจำนวนจุดรวมเทียบกับเส้นกึ่งกลางแทน ถ้าน้อยผิดปกติให้ถือว่าพังจริง
+                val totalChainPoints = chains.sumOf { it.size }
+                val looksValid = totalChainPoints >= centerLine.size
 
-                // ── ตาข่ายนิรภัย: ถ้า JTS ไม่ได้ผลเลย ใช้การออฟเซ็ตตรง ──
-                if (drawn == 0) {
+                if (looksValid) {
+                    chains.forEach { chain ->
+                        if (chain.size > 1) {
+                            writer.writePolyline(layer, chain.map { doubleArrayOf(it.x, it.y) })
+                        }
+                    }
+                } else {
+                    // ── ตาข่ายนิรภัย: ถ้า JTS ไม่ได้ผลจริง (หรือได้ผลเพี้ยน) ใช้การออฟเซ็ตตรง ──
                     RoadGeometry.edgeLines(centerLine, halfWidth).forEach { edge ->
                         if (edge.size > 1) {
                             writer.writePolyline(layer, edge.map { doubleArrayOf(it.x, it.y) })
@@ -213,7 +222,10 @@ object DxfExporter {
                 RoadGeometry.laneDividerOffsets(attrs.lanes ?: 2, carriageway).forEach { off ->
                     val line = RoadGeometry.offsetPolyline(centerLine, off)
                     if (line.size > 1) {
-                        writer.writePolyline(layer, line.map { doubleArrayOf(it.x, it.y) }, linetype = "DASHED")
+                        // แก้แล้ว — เดิมใช้ `layer` (= ชั้นของช่วงถนน เช่น ROAD_SEG_01) ทำให้เส้นแบ่งเลน
+                        // ไปรวมกับเส้นขอบถนนในชั้นเดียวกัน (สีเดียวกัน) ทั้งที่ประกาศชั้น "LANE_DIVIDER"
+                        // ไว้ในตาราง layer แล้วแต่ไม่เคยถูกใช้จริงเลยสักที่
+                        writer.writePolyline("LANE_DIVIDER", line.map { doubleArrayOf(it.x, it.y) }, linetype = "DASHED")
                     }
                 }
             }

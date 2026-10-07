@@ -216,7 +216,10 @@ object RoadGeometry {
      */
     fun shoulderEdgeOffsets(carriagewayWidth: Double, shoulderWidth: Double): List<Double> {
         if (shoulderWidth <= 0.0) return emptyList()
+        // เส้นแบ่งต้องอยู่ที่ขอบช่องทางเดินรถ (±carriageway/2) ไม่ใช่ขอบถนนรวม (±total/2)
+        // ค่าเดิมบวก shoulderWidth เข้าไปด้วย ทำให้ไปซ้อนทับเส้นขอบถนนด้านนอกเป๊ะ ๆ
+        // (totalWidth/2 = carriageway/2 + shoulder) จึงดูเหมือนไม่มีเส้นไหล่ทางเลย
         val half = carriagewayWidth / 2
-        return listOf(-(half + shoulderWidth), half + shoulderWidth)
+        return listOf(-half, half)
     }
 }

@@ -439,7 +439,8 @@ private fun RoadSegmentDialog(
     var end by remember { mutableIntStateOf(segment.endChainageMeters) }
     var lanes by remember { mutableIntStateOf(segment.lanes) }
     var laneWidth by remember { mutableStateOf(segment.laneWidthMeters?.let { fmtNum(it) } ?: "3.5") }
-    var width by remember { mutableStateOf(segment.widthMeters?.let { fmtNum(it) } ?: "") }
+    // ไม่เปิดให้กรอก "กว้างรวม" เองอีกต่อไป (ดูหมายเหตุด้านล่าง) — คำนวณจากเลน × กว้าง/เลน เสมอ
+    val width = ""
     var shoulder by remember { mutableStateOf(segment.shoulderMeters?.let { fmtNum(it) } ?: "") }
     var surface by remember { mutableStateOf(segment.surface) }
     var note by remember { mutableStateOf(segment.note) }
@@ -490,16 +491,33 @@ private fun RoadSegmentDialog(
                 }
 
                 // ✅ ชิป 5 อันเท่ากัน — weight(1f) ไม่ล้น
+                // "5+" เป็นชิปเลือกช่วง ไม่ใช่ค่าตายตัว — กดแล้วเผยช่องกรอกจำนวนจริงด้านล่างสำหรับถนน 5 เลนขึ้นไป
                 Text("จำนวนเลน (ต่อทิศทาง)", style = MaterialTheme.typography.labelMedium)
                 Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                    (1..5).forEach { n ->
+                    (1..4).forEach { n ->
                         FilterChip(
                             selected = lanes == n,
                             onClick = { lanes = n },
-                            label = { Text(if (n == 5) "5+" else "$n", style = MaterialTheme.typography.labelMedium, maxLines = 1) },
+                            label = { Text("$n", style = MaterialTheme.typography.labelMedium, maxLines = 1) },
                             modifier = Modifier.weight(1f)
                         )
                     }
+                    FilterChip(
+                        selected = lanes >= 5,
+                        onClick = { if (lanes < 5) lanes = 5 },
+                        label = { Text("5+", style = MaterialTheme.typography.labelMedium, maxLines = 1) },
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+                if (lanes >= 5) {
+                    OutlinedTextField(
+                        lanes.toString(),
+                        { txt -> txt.filter(Char::isDigit).take(2).toIntOrNull()?.let { lanes = it.coerceIn(5, 20) } },
+                        Modifier.fillMaxWidth(),
+                        label = { Text("ระบุจำนวนเลนจริง (ต่อทิศทาง)") },
+                        supportingText = { Text("สูงสุด 20 เลนต่อทิศทาง") },
+                        singleLine = true
+                    )
                 }
 
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -517,12 +535,11 @@ private fun RoadSegmentDialog(
                     )
                 }
 
-                OutlinedTextField(
-                    width, { width = it.filter { c -> c.isDigit() || c == '.' }.take(5) },
-                    Modifier.fillMaxWidth(),
-                    label = { Text("กว้างรวม (ถ้าวัดแล้ว)") },
-                    supportingText = { Text("ว่าง = คำนวณจากเลน × กว้าง/เลน") }, singleLine = true
-                )
+                // ช่อง "กว้างรวม (ถ้าวัดแล้ว)" ถูกเอาออก — สร้างความสับสนเพราะจริง ๆ แล้วแอปใช้ค่านี้แทน
+                // "กว้างช่องทางเดินรถ" (ไม่รวมไหล่ทาง) ไม่ใช่กว้างรวมทั้งหมดตามชื่อ ให้แอปคำนวณจาก
+                // เลน × กว้าง/เลน เสมอแทน — แม่นยำกว่าและไม่มีทางกรอกผิดความหมาย
+                // (ค่า widthMeters ยังอยู่ใน RoadSegment/RoadAttributes สำหรับ data model เดิม
+                // แต่ไม่เปิดให้กรอกจาก UI นี้อีกต่อไป — width จะเป็นค่าว่างเสมอ)
 
                 // ✅ สูตรชัดเจน ไม่ต้องเดาเอง
                 Surface(color = Color(0xFFEFF8F1), shape = RoundedCornerShape(8.dp)) {
@@ -707,13 +724,29 @@ private fun JunctionEditDialog(
                 if (override) {
                     Text("จำนวนเลน", style = MaterialTheme.typography.labelMedium)
                     Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                        (1..5).forEach { n ->
+                        (1..4).forEach { n ->
                             FilterChip(
                                 selected = lanes == n, onClick = { lanes = n },
-                                label = { Text(if (n == 5) "5+" else "$n", maxLines = 1) },
+                                label = { Text("$n", maxLines = 1) },
                                 modifier = Modifier.weight(1f)
                             )
                         }
+                        FilterChip(
+                            selected = lanes >= 5,
+                            onClick = { if (lanes < 5) lanes = 5 },
+                            label = { Text("5+", maxLines = 1) },
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                    if (lanes >= 5) {
+                        OutlinedTextField(
+                            lanes.toString(),
+                            { txt -> txt.filter(Char::isDigit).take(2).toIntOrNull()?.let { lanes = it.coerceIn(5, 20) } },
+                            Modifier.fillMaxWidth(),
+                            label = { Text("ระบุจำนวนเลนจริง") },
+                            supportingText = { Text("สูงสุด 20 เลนต่อทิศทาง") },
+                            singleLine = true
+                        )
                     }
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         OutlinedTextField(width, { width = it.filter { c -> c.isDigit() || c == '.' }.take(5) }, Modifier.weight(1f), label = { Text("กว้าง (ม.)") }, singleLine = true)
